@@ -1,0 +1,24 @@
+{
+  "name": "email-scraper",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Crawl websites from a CSV list and extract every email address into a name,email CSV",
+  "scripts": {
+    "scrape": "tsx src/index.ts",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "cheerio": "^1.2.0",
+    "csv-parse": "^7.0.3",
+    "csv-stringify": "^6.9.0",
+    "p-limit": "^7.3.3",
+    "playwright": "^1.63.0",
+    "robots-parser": "^3.0.1"
+  },
+  "devDependencies": {
+    "@types/node": "^26.6.3",
+    "tsx": "^4.23.15",
+    "typescript": "^7.0.2"
+  }
+}
