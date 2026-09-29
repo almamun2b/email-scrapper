@@ -60,10 +60,12 @@ function writeSummary(base: string, sites: string[], done: Map<string, SiteResul
   const partial = results.filter((r) => r.emails.length && r.error);
   const seen = new Set<string>();
   let persons = 0;
+  let departments = 0;
   for (const r of results) for (const e of r.emails) {
     if (seen.has(e.email)) continue;
     seen.add(e.email);
     if (e.name) persons++;
+    else if (e.pageTitle) departments++;
   }
   const host = (r: SiteResult) => baseHost(new URL(r.site).hostname);
   const top = [...withEmails].sort((a, b) => b.emails.length - a.emails.length).slice(0, 5);
@@ -71,7 +73,7 @@ function writeSummary(base: string, sites: string[], done: Map<string, SiteResul
   const lines = [
     `[${stamp}] ${base}.csv  (${mode}, took ${fmtDuration(Date.now() - startedAt)})`,
     `  Websites : ${sites.length} total | ${withEmails.length} with emails | ${noEmails.length} no emails found | ${failed.length} failed`,
-    `  Emails   : ${uniqueEmails} unique (${persons} with a person name, ${uniqueEmails - persons} business name)`,
+    `  Emails   : ${uniqueEmails} unique (${persons} person name, ${departments} department page title, ${uniqueEmails - persons - departments} business name)`,
     `  Crawl    : ${results.reduce((n, r) => n + r.pages, 0)} pages fetched | headless browser used on ${results.filter((r) => r.usedBrowser).length} sites`,
   ];
   if (reasons.size) lines.push(`  Failures : ${[...reasons].map(([k, v]) => `${k}=${v}`).join(', ')}`);
@@ -142,7 +144,7 @@ async function processFile(file: string, retryFailed: boolean, summaryOnly = fal
     for (const e of r.emails) {
       if (seenEmail.has(e.email)) continue;
       seenEmail.add(e.email);
-      rows.push([e.name || r.business, e.email, r.site, e.link ?? '']);
+      rows.push([e.name || e.pageTitle || r.business, e.email, r.site, e.link ?? '']);
     }
   }
   fs.writeFileSync(outFile, stringify(rows, { header: true, columns: ['name', 'email', 'website', 'link'] }));

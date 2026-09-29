@@ -2,19 +2,30 @@ import * as cheerio from 'cheerio';
 import robotsModule from 'robots-parser';
 import { chromium, type Browser } from 'playwright';
 import pLimit from 'p-limit';
-import { baseHost, canonical, crawlable, priority } from './urls.js';
+import { baseHost, canonical, crawlable, inSection, priority, sectionPrefix } from './urls.js';
 import { businessName, extractFromHtml, looksJsRendered, type Found } from './extract.js';
 
 export interface FoundOnPage extends Found {
   link: string; // page the email was found on
+  pageTitle?: string; // department page title, set only for section sub-pages
 }
 
-type EmailHit = { name: string | null; link: string };
+type EmailHit = { name: string | null; link: string; pageTitle?: string };
 
 /** Keep the first page an email was seen on, but upgrade to a page that ties it to a person name. */
 function merge(into: Map<string, EmailHit>, email: string, hit: EmailHit): void {
   const prev = into.get(email);
   if (prev === undefined || (prev.name === null && hit.name)) into.set(email, hit);
+}
+
+/** Department name for a section sub-page: its <h1>, else the first segment of <title>. */
+function pageTitleOf(html: string): string | undefined {
+  const $ = cheerio.load(html);
+  const clean = (t: string) => t.replace(/\s+/g, ' ').trim();
+  const h1 = clean($('h1').first().text());
+  if (h1 && h1.length <= 100) return h1;
+  const title = clean($('title').first().text()).split(/\s+[|–—]\s+|\s+-\s+/)[0]?.trim();
+  return title && title.length <= 100 ? title : undefined;
 }
 
 export interface SiteResult {
@@ -33,6 +44,22 @@ interface Robots {
 }
 const robotsParser = ((robotsModule as any).default ?? robotsModule) as (url: string, txt: string) => Robots;
 
+const robotsCache = new Map<string, Promise<Robots | undefined>>();
+
+/** robots.txt for an origin (cached for the whole run); undefined when the site has none. */
+function loadRobots(origin: string): Promise<Robots | undefined> {
+  let p = robotsCache.get(origin);
+  if (!p) {
+    p = httpGet(origin + '/robots.txt', 'text/plain,*/*').then((r) =>
+      r && /user-agent/i.test(r.body) && !/<html/i.test(r.body) ? robotsParser(origin + '/robots.txt', r.body) : undefined,
+    );
+    robotsCache.set(origin, p);
+  }
+  return p;
+}
+
+const allowed = (robots: Robots | undefined, url: string) => robots?.isAllowed(url, UA) !== false;
+
 const UA =
   'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36';
 const MAX_PAGES = 150;
@@ -49,7 +76,30 @@ type Fetcher = (url: string) => Promise<Fetched | null>;
 
 // ---------------- HTTP ----------------
 
-async function httpGet(url: string, accept = 'text/html,application/xhtml+xml,*/*;q=0.8'): Promise<{ body: string; url: string; type: string } | null> {
+// Caps concurrent requests to one server across all sites crawled in parallel
+// (many input domains can redirect to the same host).
+const HOST_CONCURRENCY = 3;
+const hostLimits = new Map<string, ReturnType<typeof pLimit>>();
+
+function hostLimit(url: string): ReturnType<typeof pLimit> {
+  const host = baseHost(new URL(url).hostname);
+  let l = hostLimits.get(host);
+  if (!l) hostLimits.set(host, (l = pLimit(HOST_CONCURRENCY)));
+  return l;
+}
+
+type HttpResult = { body: string; url: string; type: string };
+
+async function httpGet(url: string, accept = 'text/html,application/xhtml+xml,*/*;q=0.8'): Promise<HttpResult | null> {
+  const first = await hostLimit(url)(() => httpGetOnce(url, accept));
+  if (first !== 'retry') return first;
+  await new Promise((r) => setTimeout(r, 3_000));
+  const second = await hostLimit(url)(() => httpGetOnce(url, accept));
+  return second === 'retry' ? null : second;
+}
+
+/** 'retry' for rate limiting (429/503) and network errors, null for other failures. */
+async function httpGetOnce(url: string, accept: string): Promise<HttpResult | null | 'retry'> {
   const ctl = new AbortController();
   const timer = setTimeout(() => ctl.abort(), HTTP_TIMEOUT);
   try {
@@ -58,6 +108,7 @@ async function httpGet(url: string, accept = 'text/html,application/xhtml+xml,*/
       redirect: 'follow',
       headers: { 'user-agent': UA, accept, 'accept-language': 'en-NZ,en;q=0.9' },
     });
+    if (res.status === 429 || res.status === 503) return 'retry';
     if (!res.ok) return null;
     const type = res.headers.get('content-type') ?? '';
     if (!res.body) return null;
@@ -73,7 +124,7 @@ async function httpGet(url: string, accept = 'text/html,application/xhtml+xml,*/
     }
     return { body: Buffer.concat(chunks).toString('utf8'), url: res.url || url, type };
   } catch {
-    return null;
+    return ctl.signal.aborted ? null : 'retry';
   } finally {
     clearTimeout(timer);
   }
@@ -145,6 +196,7 @@ interface CrawlOut {
   emails: Map<string, EmailHit>;
   pages: number;
   home: Fetched | null;
+  blocked?: boolean; // landing page disallowed by robots.txt
 }
 
 function collectLinks(html: string, pageUrl: string): URL[] {
@@ -186,39 +238,61 @@ async function crawl(
   start: string,
   fetcher: Fetcher,
   maxPages: number,
-  opts: { deadline?: number; robots?: Robots; extraSeeds?: string[]; concurrency?: number; skipRobots?: boolean },
+  opts: { deadline?: number; useSitemap?: boolean; concurrency?: number },
 ): Promise<CrawlOut> {
   const emails = new Map<string, EmailHit>();
   const seen = new Set<string>();
   const queue: { url: string; pri: number }[] = [];
   let pages = 0;
-  let home: Fetched | null = null;
   let host = new URL(start).hostname;
+  let robots = await loadRobots(new URL(start).origin);
+  let section: string | null = null;
+  let landingKey = '';
+
+  if (!allowed(robots, start)) return { emails, pages: 0, home: null, blocked: true };
 
   const enqueue = (u: URL, depth: number) => {
     if (!crawlable(u, host)) return;
     const key = canonical(u);
     if (seen.has(key)) return;
-    if (opts.robots && !opts.skipRobots && opts.robots.isAllowed(u.toString(), UA) === false) return;
+    if (!allowed(robots, u.toString())) return;
     seen.add(key);
-    queue.push({ url: u.toString(), pri: priority(u, depth) });
+    queue.push({ url: u.toString(), pri: priority(u, depth, section) });
   };
 
   // homepage first (sequential so we know the final host)
   const first = await fetcher(start);
   if (!first) return { emails, pages: 0, home: null };
-  home = first;
   pages++;
-  host = new URL(first.url).hostname;
-  seen.add(canonical(new URL(first.url)));
+  const landing = new URL(first.url);
+  host = landing.hostname;
+  // A redirect to another server means that server's robots.txt applies.
+  if (landing.origin !== new URL(start).origin) {
+    robots = await loadRobots(landing.origin);
+    if (!allowed(robots, first.url)) return { emails, pages, home: first, blocked: true };
+  }
+  section = sectionPrefix(new URL(start), landing);
+  landingKey = canonical(landing);
+  seen.add(landingKey);
   seen.add(canonical(new URL(start)));
+
   const ingest = (html: string, link: string) => {
-    for (const f of extractFromHtml(html)) merge(emails, f.email, { name: f.name, link });
+    const found = extractFromHtml(html);
+    if (!found.length) return;
+    const u = new URL(link);
+    const title = section && inSection(u, section) && canonical(u) !== landingKey ? pageTitleOf(html) : undefined;
+    for (const f of found) merge(emails, f.email, { name: f.name, link, pageTitle: title });
   };
   ingest(first.html, first.url);
   for (const l of collectLinks(first.html, first.url)) enqueue(l, 1);
-  for (const s of opts.extraSeeds ?? []) {
-    try { enqueue(new URL(s), 1); } catch { /* ignore */ }
+  if (opts.useSitemap) {
+    const sm = await loadSitemapUrls(landing.origin, robots?.getSitemaps() ?? []).catch(() => []);
+    for (const s of sm) {
+      try {
+        const u = new URL(s);
+        if (!section || inSection(u, section)) enqueue(u, 1);
+      } catch { /* ignore */ }
+    }
   }
 
   const depthOf = new Map<string, number>();
@@ -252,7 +326,7 @@ async function crawl(
     }
   });
   await Promise.all(workers);
-  return { emails, pages, home };
+  return { emails, pages, home: first };
 }
 
 function candidateStarts(site: string): string[] {
@@ -284,11 +358,12 @@ export async function scrapeSite(site: string, budgetMs = 10 * 60_000): Promise<
   // --- Phase 1: plain HTTP ---
   let httpOut: CrawlOut | null = null;
   for (const start of candidateStarts(site)) {
-    const origin = new URL(start).origin;
-    const robotsRes = await httpGet(origin + '/robots.txt', 'text/plain,*/*');
-    const robots = robotsRes && /user-agent/i.test(robotsRes.body) ? robotsParser(origin + '/robots.txt', robotsRes.body) : undefined;
-    const sm = await loadSitemapUrls(origin, robots?.getSitemaps() ?? []).catch(() => []);
-    const out = await crawl(start, httpFetcher, MAX_PAGES, { robots, extraSeeds: sm, deadline });
+    const out = await crawl(start, httpFetcher, MAX_PAGES, { useSitemap: true, deadline });
+    if (out.blocked) {
+      result.error = 'robots-disallowed';
+      if (out.home) result.finalUrl = out.home.url;
+      return result;
+    }
     if (out.home) { httpOut = out; break; }
   }
   if (httpOut?.home) {
@@ -306,7 +381,12 @@ export async function scrapeSite(site: string, budgetMs = 10 * 60_000): Promise<
     try {
       let out: CrawlOut | null = null;
       for (const start of candidateStarts(site).filter((s) => s.startsWith('https:'))) {
-        out = await crawl(start, fetcher, BROWSER_MAX_PAGES, { skipRobots: true, concurrency: 2, deadline });
+        out = await crawl(start, fetcher, BROWSER_MAX_PAGES, { concurrency: 2, deadline });
+        if (out.blocked) {
+          result.error = 'robots-disallowed';
+          if (out.home) result.finalUrl = out.home.url;
+          return result;
+        }
         if (out.home) break;
       }
       if (out?.home) {
@@ -331,6 +411,6 @@ export async function scrapeSite(site: string, budgetMs = 10 * 60_000): Promise<
     return result;
   }
   result.business = businessName(homeHtml, homeHost);
-  result.emails = [...all].map(([email, h]) => ({ email, name: h.name, link: h.link }));
+  result.emails = [...all].map(([email, h]) => ({ email, name: h.name, link: h.link, pageTitle: h.pageTitle }));
   return result;
 }

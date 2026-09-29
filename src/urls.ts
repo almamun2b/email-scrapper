@@ -57,10 +57,32 @@ export function crawlable(url: URL, host: string): boolean {
   return true;
 }
 
+/** True if `url` is inside the section rooted at `prefix` (e.g. /hospitals/auckland/central). */
+export function inSection(url: URL, prefix: string): boolean {
+  const p = url.pathname.replace(/\/+$/, '');
+  return p === prefix || p.startsWith(prefix + '/');
+}
+
+/**
+ * The path prefix to focus a crawl on, or null for a whole-site crawl.
+ * A section is a landing page with a real path: one given in the input, one reached by a
+ * redirect to another domain, or any path at least two segments deep. A single-segment
+ * same-domain redirect like /home or /en is treated as the whole site.
+ */
+export function sectionPrefix(input: URL, landing: URL): string | null {
+  const path = landing.pathname.replace(/\/+$/, '');
+  if (!path || /^\/(index|default|home)(\.[a-z]+)?$/i.test(path)) return null;
+  const inputHasPath = input.pathname.replace(/\/+$/, '') !== '';
+  const crossDomain = baseHost(input.hostname) !== baseHost(landing.hostname);
+  const deep = path.split('/').filter(Boolean).length >= 2;
+  return inputHasPath || crossDomain || deep ? path : null;
+}
+
 /** Lower = fetched sooner. */
-export function priority(url: URL, depth: number): number {
+export function priority(url: URL, depth: number, section?: string | null): number {
   const p = decodeURIComponent(url.pathname);
   const hit = PRIORITY_PATH.test(p);
   const strong = /(contact|get-in-touch|enquir|find-us|about|team|staff|meet)/i.test(p);
-  return (strong ? 0 : hit ? 5 : 20) + depth * 3 + (url.search ? 4 : 0);
+  const sectionAdj = section ? (inSection(url, section) ? -20 : 15) : 0;
+  return (strong ? 0 : hit ? 5 : 20) + depth * 3 + (url.search ? 4 : 0) + sectionAdj;
 }
