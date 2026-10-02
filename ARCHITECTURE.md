@@ -6,13 +6,13 @@ This document explains how the email scraper is put together: the data flow, the
 
 ```
 websites/<name>.csv
-        │  readSites(): detect column, normalise, dedupe by host
+        │  readSites(): detect column, normalise, dedupe by host+path
         ▼
 ┌──────────────────────── src/index.ts ────────────────────────┐
 │  for each input file (sequential)                             │
 │    load emails/.cache/<name>.jsonl  (resume / reuse)          │
-│    p-limit(SITE_CONCURRENCY=12) over uncached sites:          │
-│        withTimeout(scrapeSite(site), 14 min)                  │
+│    p-limit(--concurrency=12) over uncached sites:             │
+│        withTimeout(scrapeSite(site, opts), budget + 4 min)    │
 │        append SiteResult → .cache/<name>.jsonl                │
 │    build CSV (input order, unique by email)                   │
 │    writeSummary() → console + emails/logs/<name>.log          │
@@ -20,9 +20,9 @@ websites/<name>.csv
         │ scrapeSite(site)
         ▼
 ┌──────────────────────── src/crawler.ts ──────────────────────┐
-│  Phase 1: crawl(start, httpFetcher, 150 pages, sitemap)       │
+│  Phase 1: crawl(start, httpFetcher, maxPages=400, sitemap)    │
 │    tries https → http → www. variants until one loads          │
-│  Phase 2 (conditional): crawl(start, browserFetcher, 30 pages) │
+│  Phase 2 (conditional): crawl(start, browserFetcher, 60 pages) │
 │  businessName(homeHtml)                                       │
 └───────────────────────────────────────────────────────────────┘
         │ every fetched page
@@ -74,7 +74,9 @@ interface FoundOnPage {
   - Otherwise existing lines are loaded into `done`, which gives resume-after-interrupt.
   - With `--retry-failed`, lines with an `error` are dropped and the cache is rewritten before scraping, so only failed sites are re-crawled.
   - The cache is **never deleted after a successful run**. The user relies on it for later analysis.
-- **Concurrency:** 12 sites at once. Each site is wrapped in a 14-minute hard timeout that yields an empty `error: 'timeout'` result. `scrapeSite` normally stops itself earlier (10-minute budget) and keeps partial results.
+- **Options:** `parseArgs()` splits argv into boolean flags, numeric options (`--x=N` or `--x N`) and file paths. Unknown flags are an error. `RunOptions` starts from `DEFAULT_OPTIONS` (deep) or `QUICK_OPTIONS` (`--quick`), and explicit options override it. The options are printed at start and included in the summary's mode string.
+- **Input dedupe:** `readSites()` keys rows on `baseHost(host) + path` (trailing slash stripped). `www.` duplicates of a domain merge, while several dealer pages on one group domain stay separate sites.
+- **Concurrency:** `--concurrency` sites at once (12). Each site is wrapped in a hard timeout of `budget + 4 min` (24 min by default) that yields an empty `error: 'timeout'` result. `scrapeSite` normally stops itself at the soft budget (20 min by default) and keeps partial results.
 - **CSV:** rows are built in input order and are unique by email across the whole file (first site wins). `name = e.name || e.pageTitle || r.business`. The columns are fixed: `name,email,website,link`.
 - **Summary:** `writeSummary()` prints the summary and appends it to `emails/logs/<name>.log`. It counts sites with emails, sites with no emails, failed sites grouped by reason, partial results, name-source breakdown, and top sites.
 
@@ -93,7 +95,18 @@ interface FoundOnPage {
 4. Extract emails from the landing page, then enqueue its links. For the HTTP phase, also enqueue sitemap URLs, filtered to the section if there is one.
 5. Worker pool (3 for HTTP, 2 for the browser): pop the lowest-priority-score URL, fetch it, extract emails, and enqueue new links at `depth + 1`. Stop at the page cap or the deadline.
 
-`enqueue` applies `crawlable()`, dedupes with `canonical()`, and checks `robots.isAllowed()`.
+`enqueue` drops links deeper than `maxDepth` (when it is non-zero), applies `crawlable()`, dedupes with `canonical()`, and checks `robots.isAllowed()`. The landing page is level 0. Its links and sitemap seeds are level 1.
+
+**Limits (`CrawlOptions`).** `scrapeSite(site, options)` merges `options` over `DEFAULT_OPTIONS`:
+
+| | `DEFAULT_OPTIONS` (deep) | `QUICK_OPTIONS` |
+|---|---|---|
+| `maxPages` (HTTP) | 400 | 150 |
+| `browserPages` | 60 | 30 |
+| `maxDepth` (0 = unlimited) | 0 | 0 |
+| `budgetMs` (soft) | 20 min | 10 min |
+
+**Sitemaps.** `loadSitemapUrls()` reads at most 8 sitemap files and 2000 URLs. Sub-sitemaps whose URL looks like stock, inventory, vehicles or products (`LISTING_SITEMAP`) are read last, so page and post sitemaps aren't crowded out by listings.
 
 **`scrapeSite()` phases:**
 - Phase 1 (HTTP) tries the `candidateStarts(site)` variants in order (https, http, www.) until one yields a landing page.
@@ -139,7 +152,10 @@ interface FoundOnPage {
         | 5 (other PRIORITY_PATH keywords)
         | 20 (everything else)
   score = base + 3·depth + 4·(has query) + (section ? (inside ? −20 : +15) : 0)
+          + 40·(below a listing segment)
   ```
+
+  `PRIORITY_PATH` also covers dealer and tourism departments: sales, parts, service, finance, fleet, accessories, careers, groups, trade, agents, media, partners, bookings, wholesale. A *listing segment* (`LISTING_SEGMENT`) is a non-final path segment such as `stock`, `inventory`, `new-cars`, `used-vehicles`, `demo`, `vehicles`, `showroom`, `offers`, `specials`, `news`, `blog`, `events` or `products`. Detail pages below it, like `/used-cars/<car>` or `/news/<post>`, are fetched last because they rarely carry emails and dealer sites have thousands of them. The bare index page (`/used-cars`) keeps its normal score, so its links are still discovered.
 
 - `sectionPrefix(input, landing)` returns the landing path when the input URL had a path, when the redirect crossed domains, or when the path is 2+ segments deep. It returns `null` for `/`, `/index`, `/default` and `/home` (with or without an extension like `.html`), and for a shallow same-domain redirect.
 
@@ -149,9 +165,10 @@ interface FoundOnPage {
 |---|---|
 | HTTP first, browser only as fallback | Most sites are server-rendered. Chromium is about 10× slower and much heavier, so it's used only when it's likely to help |
 | Priority queue instead of plain BFS | With a page cap, contact/team pages must come first. Section bonus and penalty keep big multi-tenant sites focused |
+| Deep crawl by default (400 pages, unlimited depth) + listing penalty | Owner decision (2026-10-02). On car dealer sites the old 150-page cap was spent on stock listings, before department pages were reached. `--quick` keeps the old limits |
 | Respect robots.txt on the final host and in the browser | User decision (2026-09-29). Domains that redirect to a host disallowing generic bots report `robots-disallowed` |
 | Per-server concurrency limit | Many inputs can share one server. Without the limit that server rate-limits or blocks, and sites fail |
-| Soft 10-minute budget + hard 14-minute timeout | Large sites keep what they found instead of losing everything to a timeout |
+| Soft budget (20 min) + hard timeout (budget + 4 min) | Large sites keep what they found instead of losing everything to a timeout |
 | Append-only JSONL cache, kept forever | Crash-safe resume, cheap `--retry-failed` / `--summary-only`, and data for later heuristic tuning |
 | One row per email per file | Aggregator sites repeat the same addresses. Output is a contact list, not a page index |
 | Conservative person naming | A wrong person name is worse than a business name. Names must be consistent with the local part |
@@ -161,5 +178,5 @@ interface FoundOnPage {
 - **New output column:** add it to `FoundOnPage`/`SiteResult` if it's per-email or per-site data, fill it in `crawler.ts`, then add it to the `rows.push` tuple and `columns` in `processFile()`. Old cache lines won't have it, so default it.
 - **New email source or obfuscation:** add it in `extractFromHtml()` or `deobfuscate()`, and route every candidate through `cleanEmail()`.
 - **New junk pattern:** extend `JUNK_DOMAINS`, `JUNK_LOCAL`, `BAD_TLD_SUFFIX` or `GTLDS` in `extract.ts`.
-- **Crawl scope:** change `SKIP_EXT`, `SKIP_PATH`, `PRIORITY_PATH` in `urls.ts`, or the limits in `crawler.ts`.
-- **New CLI flag:** parse it in `main()` and pass it into `processFile()`. Keep the rule that the CSV and summary are derived from the `done` map, so every mode produces consistent outputs.
+- **Crawl scope:** change `SKIP_EXT`, `SKIP_PATH`, `PRIORITY_PATH`, `LISTING_SEGMENT` in `urls.ts`, or `DEFAULT_OPTIONS`/`QUICK_OPTIONS` in `crawler.ts`.
+- **New CLI flag:** boolean flags go in the known-flags list in `main()`, numeric ones in `NUMERIC_FLAGS`. Parse it in `main()` and pass it into `processFile()`. Keep the rule that the CSV and summary are derived from the `done` map, so every mode produces consistent outputs.

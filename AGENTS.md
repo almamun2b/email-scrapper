@@ -9,7 +9,7 @@ The owner regularly drops a CSV of websites into `websites/` and asks the agent 
 Standard procedure:
 
 1. Check the input: `head -5 websites/<file>.csv` and `wc -l websites/<file>.csv`. Any header named `website`/`url`/`domain`/`site`/`websites`/`link` works; otherwise the first column is used.
-2. Run it in the background, because it takes about 30–60 minutes per 150 sites:
+2. Run it in the background, because it takes about 1–2 hours per 150 sites with the default deep crawl (30–60 minutes with `--quick`):
    ```bash
    nohup npm run scrape -- websites/<file>.csv > <scratch>/run.log 2>&1 &
    ```
@@ -29,6 +29,10 @@ Standard procedure:
 | Re-scrape everything | `npm run scrape -- --force` |
 | Re-scrape only failed sites | `npm run scrape -- --retry-failed` |
 | Rebuild CSVs and logs from cache, no network | `npm run scrape -- --summary-only` |
+| Lighter, faster crawl (150 pages, 10 min/site) | `npm run scrape -- --quick` |
+| Tune limits (any combination) | `--max-pages=N --browser-pages=N --max-depth=N --budget=MIN --concurrency=N` |
+
+Deep crawl is the default: 400 pages, 60 browser pages, unlimited depth (`--max-depth=0`), 20 min per site. Use it for dealer, tourism and other large-site lists. Use `--quick` only when the owner wants speed over coverage. All flags are documented in README.md under "Crawl options".
 
 There is no test suite. To test changes, use a throwaway `.mts` script (ESM, top-level `await` allowed) run with `npx tsx`, and put it outside the repo:
 
@@ -42,7 +46,7 @@ console.log(r.error, r.pages, r.emails);
 await closeBrowser();
 ```
 
-Regression baseline: `https://lumino.co.nz/` gives 3 emails, including `craig.kirkland@lumino.co.nz` named "Craig Kirkland". `https://adhb.health.nz/` gives `robots-disallowed`.
+Regression baseline: `https://lumino.co.nz/` gives 6 emails with the deep defaults (3 with `QUICK_OPTIONS`), including `craig.kirkland@lumino.co.nz` named "Craig Kirkland". `https://adhb.health.nz/` gives `robots-disallowed`.
 
 For an end-to-end check, write a 2–4 row sample CSV outside `websites/` and run `npm run scrape -- <path>`. Then **delete** the generated `emails/<sample>.csv`, `emails/.cache/<sample>.jsonl` and `emails/logs/<sample>.log`.
 

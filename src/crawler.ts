@@ -62,8 +62,17 @@ const allowed = (robots: Robots | undefined, url: string) => robots?.isAllowed(u
 
 const UA =
   'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36';
-const MAX_PAGES = 150;
-const BROWSER_MAX_PAGES = 30;
+/** Per-site crawl limits. Depth is click-levels from the landing page (level 0); 0 means unlimited. */
+export interface CrawlOptions {
+  maxPages: number; // plain-HTTP pages (phase 1)
+  browserPages: number; // headless-browser pages (phase 2)
+  maxDepth: number;
+  budgetMs: number; // soft budget; partial results are kept when it runs out
+}
+
+export const DEFAULT_OPTIONS: CrawlOptions = { maxPages: 400, browserPages: 60, maxDepth: 0, budgetMs: 20 * 60_000 };
+export const QUICK_OPTIONS: CrawlOptions = { maxPages: 150, browserPages: 30, maxDepth: 0, budgetMs: 10 * 60_000 };
+
 const HTTP_TIMEOUT = 15_000;
 const MAX_BYTES = 5 * 1024 * 1024;
 const PAGE_CONCURRENCY = 3;
@@ -106,7 +115,7 @@ async function httpGetOnce(url: string, accept: string): Promise<HttpResult | nu
     const res = await fetch(url, {
       signal: ctl.signal,
       redirect: 'follow',
-      headers: { 'user-agent': UA, accept, 'accept-language': 'en-NZ,en;q=0.9' },
+      headers: { 'user-agent': UA, accept, 'accept-language': 'en-AU,en-NZ;q=0.9,en;q=0.8' },
     });
     if (res.status === 429 || res.status === 503) return 'retry';
     if (!res.ok) return null;
@@ -159,7 +168,7 @@ function makeBrowserFetcher(): { fetcher: Fetcher; close: () => Promise<void> } 
   let ctxPromise: Promise<import('playwright').BrowserContext> | null = null;
   const ctx = () => {
     ctxPromise ??= getBrowser().then((b) =>
-      b.newContext({ userAgent: UA, locale: 'en-NZ', ignoreHTTPSErrors: true }),
+      b.newContext({ userAgent: UA, locale: 'en-AU', ignoreHTTPSErrors: true }),
     );
     return ctxPromise;
   };
@@ -213,6 +222,8 @@ function collectLinks(html: string, pageUrl: string): URL[] {
   return out;
 }
 
+const LISTING_SITEMAP = /(stock|inventory|vehicle|listing|product|used|new-car|demo)/i;
+
 async function loadSitemapUrls(origin: string, robotsSitemaps: string[]): Promise<string[]> {
   const queue = [...new Set([...robotsSitemaps, origin + '/sitemap.xml', origin + '/sitemap_index.xml'])];
   const seen = new Set<string>();
@@ -230,6 +241,8 @@ async function loadSitemapUrls(origin: string, robotsSitemaps: string[]): Promis
       if (/\.xml(\.gz)?$/i.test(l) || /sitemap/i.test(l)) queue.push(l);
       else urls.push(l);
     }
+    // Stock/product sitemaps can hold thousands of listings; read page/post sitemaps first.
+    queue.sort((a, b) => Number(LISTING_SITEMAP.test(a)) - Number(LISTING_SITEMAP.test(b)));
   }
   return urls;
 }
@@ -238,7 +251,7 @@ async function crawl(
   start: string,
   fetcher: Fetcher,
   maxPages: number,
-  opts: { deadline?: number; useSitemap?: boolean; concurrency?: number },
+  opts: { deadline?: number; useSitemap?: boolean; concurrency?: number; maxDepth?: number },
 ): Promise<CrawlOut> {
   const emails = new Map<string, EmailHit>();
   const seen = new Set<string>();
@@ -252,6 +265,7 @@ async function crawl(
   if (!allowed(robots, start)) return { emails, pages: 0, home: null, blocked: true };
 
   const enqueue = (u: URL, depth: number) => {
+    if (opts.maxDepth && depth > opts.maxDepth) return;
     if (!crawlable(u, host)) return;
     const key = canonical(u);
     if (seen.has(key)) return;
@@ -341,8 +355,9 @@ function candidateStarts(site: string): string[] {
   return [...new Set(list)];
 }
 
-export async function scrapeSite(site: string, budgetMs = 10 * 60_000): Promise<SiteResult> {
-  const deadline = Date.now() + budgetMs;
+export async function scrapeSite(site: string, options: Partial<CrawlOptions> = {}): Promise<SiteResult> {
+  const opt = { ...DEFAULT_OPTIONS, ...options };
+  const deadline = Date.now() + opt.budgetMs;
   const result: SiteResult = {
     site,
     finalUrl: site,
@@ -358,7 +373,7 @@ export async function scrapeSite(site: string, budgetMs = 10 * 60_000): Promise<
   // --- Phase 1: plain HTTP ---
   let httpOut: CrawlOut | null = null;
   for (const start of candidateStarts(site)) {
-    const out = await crawl(start, httpFetcher, MAX_PAGES, { useSitemap: true, deadline });
+    const out = await crawl(start, httpFetcher, opt.maxPages, { useSitemap: true, deadline, maxDepth: opt.maxDepth });
     if (out.blocked) {
       result.error = 'robots-disallowed';
       if (out.home) result.finalUrl = out.home.url;
@@ -381,7 +396,7 @@ export async function scrapeSite(site: string, budgetMs = 10 * 60_000): Promise<
     try {
       let out: CrawlOut | null = null;
       for (const start of candidateStarts(site).filter((s) => s.startsWith('https:'))) {
-        out = await crawl(start, fetcher, BROWSER_MAX_PAGES, { concurrency: 2, deadline });
+        out = await crawl(start, fetcher, opt.browserPages, { concurrency: 2, deadline, maxDepth: opt.maxDepth });
         if (out.blocked) {
           result.error = 'robots-disallowed';
           if (out.home) result.finalUrl = out.home.url;

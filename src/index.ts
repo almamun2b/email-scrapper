@@ -3,7 +3,7 @@ import path from 'node:path';
 import { parse } from 'csv-parse/sync';
 import { stringify } from 'csv-stringify/sync';
 import pLimit from 'p-limit';
-import { closeBrowser, scrapeSite, type SiteResult } from './crawler.js';
+import { closeBrowser, DEFAULT_OPTIONS, QUICK_OPTIONS, scrapeSite, type CrawlOptions, type SiteResult } from './crawler.js';
 import { baseHost, normalizeInput } from './urls.js';
 
 const ROOT = path.resolve(import.meta.dirname, '..');
@@ -11,8 +11,11 @@ const IN_DIR = path.join(ROOT, 'websites');
 const OUT_DIR = path.join(ROOT, 'emails');
 const CACHE_DIR = path.join(OUT_DIR, '.cache');
 const LOG_DIR = path.join(OUT_DIR, 'logs');
-const SITE_CONCURRENCY = 12;
-const SITE_TIMEOUT_MS = 14 * 60_000; // hard safety net; scrapeSite stops itself after 10 min and keeps partial results
+const HARD_TIMEOUT_EXTRA_MS = 4 * 60_000; // hard safety net on top of scrapeSite's soft budget, which keeps partial results
+
+interface RunOptions extends CrawlOptions {
+  concurrency: number; // sites in parallel
+}
 
 function readSites(file: string): string[] {
   const text = fs.readFileSync(file, 'utf8').replace(/^﻿/, '');
@@ -28,7 +31,9 @@ function readSites(file: string): string[] {
   for (const r of body) {
     const u = normalizeInput(r[col] ?? '');
     if (!u) continue;
-    const k = baseHost(new URL(u).hostname);
+    // Host + path, so several dealer pages on one group domain stay separate sites.
+    const url = new URL(u);
+    const k = baseHost(url.hostname) + url.pathname.replace(/\/+$/, '').toLowerCase();
     if (seen.has(k)) continue;
     seen.add(k);
     out.push(u);
@@ -50,6 +55,10 @@ function fmtDuration(ms: number): string {
 }
 
 /** Human-readable summary of one processed CSV; printed and appended to emails/logs/<name>.log. */
+function describe(o: RunOptions): string {
+  return `${o.maxPages} pages, ${o.browserPages} browser pages, depth ${o.maxDepth || 'unlimited'}, ${o.budgetMs / 60_000} min/site, ${o.concurrency} sites in parallel`;
+}
+
 function writeSummary(base: string, sites: string[], done: Map<string, SiteResult>, uniqueEmails: number, mode: string, startedAt: number): void {
   const results = sites.map((s) => done.get(s)).filter((r): r is SiteResult => !!r);
   const withEmails = results.filter((r) => r.emails.length > 0);
@@ -87,7 +96,7 @@ function writeSummary(base: string, sites: string[], done: Map<string, SiteResul
   console.log('\n' + text);
 }
 
-async function processFile(file: string, retryFailed: boolean, summaryOnly = false): Promise<void> {
+async function processFile(file: string, opts: RunOptions, retryFailed: boolean, summaryOnly = false): Promise<void> {
   const startedAt = Date.now();
   const base = path.basename(file, path.extname(file));
   const outFile = path.join(OUT_DIR, `${base}.csv`);
@@ -113,13 +122,13 @@ async function processFile(file: string, retryFailed: boolean, summaryOnly = fal
   console.log(`\n=== ${base}: ${sites.length} sites (${done.size} cached) ===`);
 
   let n = done.size;
-  const limit = pLimit(SITE_CONCURRENCY);
+  const limit = pLimit(opts.concurrency);
   await Promise.all(
     sites.map((site) =>
       limit(async () => {
         if (done.has(site) || summaryOnly) return;
         const t0 = Date.now();
-        const r = await withTimeout(scrapeSite(site), SITE_TIMEOUT_MS, () => ({
+        const r = await withTimeout(scrapeSite(site, opts), opts.budgetMs + HARD_TIMEOUT_EXTRA_MS, () => ({
           site, finalUrl: site, business: baseHost(new URL(site).hostname), emails: [], pages: 0, usedBrowser: false, error: 'timeout',
         } as SiteResult));
         done.set(site, r);
@@ -150,16 +159,47 @@ async function processFile(file: string, retryFailed: boolean, summaryOnly = fal
   fs.writeFileSync(outFile, stringify(rows, { header: true, columns: ['name', 'email', 'website', 'link'] }));
   const withEmails = sites.filter((s) => (done.get(s)?.emails.length ?? 0) > 0).length;
   console.log(`=> ${path.relative(ROOT, outFile)}: ${rows.length} emails from ${withEmails}/${sites.length} sites (${failed} failed/unreachable)`);
-  const mode = summaryOnly ? 'summary rebuilt from cache' : retryFailed ? 'retry-failed' : 'scrape';
+  const mode = summaryOnly ? 'summary rebuilt from cache' : `${retryFailed ? 'retry-failed' : 'scrape'}: ${describe(opts)}`;
   writeSummary(base, sites, done, rows.length, mode, startedAt);
 }
 
+const NUMERIC_FLAGS = ['max-pages', 'browser-pages', 'max-depth', 'budget', 'concurrency'];
+
+/** Splits argv into flags and file paths. Numeric flags accept `--x=N` and `--x N`. */
+function parseArgs(argv: string[]): { flags: Set<string>; values: Map<string, number>; files: string[] } {
+  const flags = new Set<string>();
+  const values = new Map<string, number>();
+  const files: string[] = [];
+  for (let i = 0; i < argv.length; i++) {
+    const a = argv[i];
+    if (!a.startsWith('--')) { files.push(a); continue; }
+    const [name, inline] = a.slice(2).split('=', 2);
+    if (!NUMERIC_FLAGS.includes(name)) { flags.add(name); continue; }
+    const raw = inline ?? argv[++i];
+    const n = Number(raw);
+    if (raw === undefined || !Number.isFinite(n) || n < 0) throw new Error(`--${name} needs a number, got "${raw ?? ''}"`);
+    values.set(name, n);
+  }
+  return { flags, values, files };
+}
+
 async function main() {
-  const args = process.argv.slice(2);
-  const force = args.includes('--force');
-  const retryFailed = args.includes('--retry-failed');
-  const summaryOnly = args.includes('--summary-only'); // rebuild CSV + summary log from the cache, no scraping
-  const files = args.filter((a) => !a.startsWith('--')).map((f) => path.resolve(f));
+  const { flags, values, files: fileArgs } = parseArgs(process.argv.slice(2));
+  const force = flags.has('force');
+  const retryFailed = flags.has('retry-failed');
+  const summaryOnly = flags.has('summary-only'); // rebuild CSV + summary log from the cache, no scraping
+  const base = flags.has('quick') ? QUICK_OPTIONS : DEFAULT_OPTIONS;
+  const opts: RunOptions = {
+    maxPages: values.get('max-pages') ?? base.maxPages,
+    browserPages: values.get('browser-pages') ?? base.browserPages,
+    maxDepth: values.get('max-depth') ?? base.maxDepth,
+    budgetMs: (values.get('budget') ?? base.budgetMs / 60_000) * 60_000,
+    concurrency: Math.max(1, values.get('concurrency') ?? 12),
+  };
+  const unknown = [...flags].filter((f) => !['force', 'retry-failed', 'summary-only', 'quick'].includes(f));
+  if (unknown.length) throw new Error(`Unknown option(s): ${unknown.map((f) => '--' + f).join(', ')}`);
+  if (!summaryOnly) console.log(`Crawl options: ${describe(opts)}`);
+  const files = fileArgs.map((f) => path.resolve(f));
   const targets = files.length
     ? files
     : fs.readdirSync(IN_DIR).filter((f) => f.toLowerCase().endsWith('.csv')).sort().map((f) => path.join(IN_DIR, f));
@@ -172,7 +212,7 @@ async function main() {
       console.log(`Skipping ${path.basename(f)} (output exists; use --force)`);
       continue;
     }
-    await processFile(f, retryFailed, summaryOnly);
+    await processFile(f, opts, retryFailed, summaryOnly);
   }
   await closeBrowser();
 }

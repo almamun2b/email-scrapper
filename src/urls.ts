@@ -5,7 +5,12 @@ const SKIP_PATH =
   /(\/wp-content\/uploads\/|\/wp-json\/|\/wp-admin|\/wp-login|\/xmlrpc|\/cart\b|\/checkout|\/login|\/logout|\/signin|\/register|\/my-account|\/feed\/?$|\/tag\/|\/author\/|\/calendar|\/cdn-cgi\/)/i;
 
 const PRIORITY_PATH =
-  /(contact|about|team|staff|people|our-|meet|doctor|dentist|vet\b|vets|veterinar|nurse|clinician|practitioner|location|clinic|practice|find-us|directory|enquir|reach|get-in-touch|connect|branch|hospital|service)/i;
+  /(contact|about|team|staff|people|our-|meet|doctor|dentist|vet\b|vets|veterinar|nurse|clinician|practitioner|location|clinic|practice|find-us|directory|enquir|reach|get-in-touch|connect|branch|hospital|service|sales|parts|finance|fleet|accessor|dealership|management|careers|groups|trade|agent|media|partner|booking|wholesale)/i;
+
+// A path segment that starts a listing (car stock, offers, news). Pages *below* it are detail pages:
+// dealer sites have thousands of them and they almost never carry emails.
+const LISTING_SEGMENT =
+  /^((new|used|demo|demonstrator|pre-owned|preowned)([-_]?(cars?|vehicles?|stock|inventory))?|stock|inventory|vehicles?|cars?|cars-for-sale|for-sale|search|listings?|showroom|offers?|specials?|news|blog|articles?|events?|products?)$/i;
 
 export function normalizeInput(raw: string): string | null {
   let s = raw.trim().replace(/^["']|["']$/g, '');
@@ -84,5 +89,7 @@ export function priority(url: URL, depth: number, section?: string | null): numb
   const hit = PRIORITY_PATH.test(p);
   const strong = /(contact|get-in-touch|enquir|find-us|about|team|staff|meet)/i.test(p);
   const sectionAdj = section ? (inSection(url, section) ? -20 : 15) : 0;
-  return (strong ? 0 : hit ? 5 : 20) + depth * 3 + (url.search ? 4 : 0) + sectionAdj;
+  const segs = p.split('/').filter(Boolean);
+  const listing = segs.slice(0, -1).some((s) => LISTING_SEGMENT.test(s)) ? 40 : 0;
+  return (strong ? 0 : hit ? 5 : 20) + depth * 3 + (url.search ? 4 : 0) + sectionAdj + listing;
 }
