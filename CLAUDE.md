@@ -17,7 +17,7 @@ npm run scrape -- --force                        # re-scrape everything
 npm run scrape -- --retry-failed                 # re-crawl only failed sites, reuse cache for the rest
 npm run scrape -- --summary-only                 # rebuild CSVs + logs from cache, no network
 npm run scrape -- --quick                        # lighter crawl (150 pages, 10 min/site); default is deep
-npm run scrape -- x.csv --max-pages=600 --max-depth=3 --budget=30 --browser-pages=80 --concurrency=8
+npm run scrape -- x.csv --max-pages=600 --max-depth=3 --budget=30 --browser-pages=80 --concurrency=8 --page-concurrency=3 --host-concurrency=3
 ```
 
 Deep crawl is the default: 400 HTTP pages, 60 browser pages, unlimited depth, 20 min per site. README.md "Crawl options" documents every flag.

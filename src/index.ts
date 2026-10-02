@@ -3,7 +3,7 @@ import path from 'node:path';
 import { parse } from 'csv-parse/sync';
 import { stringify } from 'csv-stringify/sync';
 import pLimit from 'p-limit';
-import { closeBrowser, DEFAULT_OPTIONS, QUICK_OPTIONS, scrapeSite, type CrawlOptions, type SiteResult } from './crawler.js';
+import { closeBrowser, DEFAULT_OPTIONS, QUICK_OPTIONS, scrapeSite, setHostConcurrency, type CrawlOptions, type SiteResult } from './crawler.js';
 import { baseHost, normalizeInput } from './urls.js';
 
 const ROOT = path.resolve(import.meta.dirname, '..');
@@ -15,6 +15,7 @@ const HARD_TIMEOUT_EXTRA_MS = 4 * 60_000; // hard safety net on top of scrapeSit
 
 interface RunOptions extends CrawlOptions {
   concurrency: number; // sites in parallel
+  hostConcurrency: number; // parallel requests to one server across all sites
 }
 
 function readSites(file: string): string[] {
@@ -56,7 +57,7 @@ function fmtDuration(ms: number): string {
 
 /** Human-readable summary of one processed CSV; printed and appended to emails/logs/<name>.log. */
 function describe(o: RunOptions): string {
-  return `${o.maxPages} pages, ${o.browserPages} browser pages, depth ${o.maxDepth || 'unlimited'}, ${o.budgetMs / 60_000} min/site, ${o.concurrency} sites in parallel`;
+  return `${o.maxPages} pages, ${o.browserPages} browser pages, depth ${o.maxDepth || 'unlimited'}, ${o.budgetMs / 60_000} min/site, ${o.concurrency} sites in parallel, ${o.pageConcurrency} page requests per site, ${o.hostConcurrency} per server`;
 }
 
 function writeSummary(base: string, sites: string[], done: Map<string, SiteResult>, uniqueEmails: number, mode: string, startedAt: number): void {
@@ -163,7 +164,7 @@ async function processFile(file: string, opts: RunOptions, retryFailed: boolean,
   writeSummary(base, sites, done, rows.length, mode, startedAt);
 }
 
-const NUMERIC_FLAGS = ['max-pages', 'browser-pages', 'max-depth', 'budget', 'concurrency'];
+const NUMERIC_FLAGS = ['max-pages', 'browser-pages', 'max-depth', 'budget', 'concurrency', 'page-concurrency', 'host-concurrency'];
 
 /** Splits argv into flags and file paths. Numeric flags accept `--x=N` and `--x N`. */
 function parseArgs(argv: string[]): { flags: Set<string>; values: Map<string, number>; files: string[] } {
@@ -195,9 +196,12 @@ async function main() {
     maxDepth: values.get('max-depth') ?? base.maxDepth,
     budgetMs: (values.get('budget') ?? base.budgetMs / 60_000) * 60_000,
     concurrency: Math.max(1, values.get('concurrency') ?? 12),
+    pageConcurrency: Math.max(1, values.get('page-concurrency') ?? base.pageConcurrency),
+    hostConcurrency: Math.max(1, values.get('host-concurrency') ?? 3),
   };
   const unknown = [...flags].filter((f) => !['force', 'retry-failed', 'summary-only', 'quick'].includes(f));
   if (unknown.length) throw new Error(`Unknown option(s): ${unknown.map((f) => '--' + f).join(', ')}`);
+  setHostConcurrency(opts.hostConcurrency);
   if (!summaryOnly) console.log(`Crawl options: ${describe(opts)}`);
   const files = fileArgs.map((f) => path.resolve(f));
   const targets = files.length

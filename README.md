@@ -172,6 +172,8 @@ There is **no depth limit by default**. The crawler follows links as deep as the
 | `--max-depth=N` | Max click level to follow from the start page. `0` = unlimited | 0 (unlimited) | 0 (unlimited) |
 | `--budget=MIN` | Soft time budget per site in minutes. When it runs out, the site stops and keeps what it found. A hard stop happens 4 minutes later | 20 | 10 |
 | `--concurrency=N` | Websites crawled in parallel | 12 | 12 |
+| `--page-concurrency=N` | Parallel page requests within one site (HTTP phase) | 3 | 3 |
+| `--host-concurrency=N` | Parallel requests to one server, across all sites | 3 | 3 |
 | `--quick` | Preset: the lighter limits above (this was the default before deep crawl) | — | — |
 
 Numbers can be written as `--max-pages=600` or `--max-pages 600`. An explicit option always overrides the preset. For example, `--quick --max-pages=250` uses the quick limits but 250 pages.
@@ -182,6 +184,29 @@ When to change them:
 - **`--max-pages=800 --budget=40`:** very large sites where emails are buried deep, such as big directories or council sites.
 - **`--max-depth=2`:** only the start page, the pages it links to, and the pages those link to. Useful for a fast, shallow sweep of a huge list.
 - **`--concurrency=6`:** a slow or unstable connection, or many sites on the same server.
+- **`--concurrency=24 --page-concurrency=4 --host-concurrency=4`:** a faster run on a good connection. Total requests in flight are at most `concurrency × page-concurrency`, and no single server gets more than `host-concurrency`. Raise the per-server number slowly: servers that see too many requests rate-limit or block.
+
+### Is a high concurrency setting safe?
+
+The most aggressive setting you might use is `--concurrency=24 --page-concurrency=4 --host-concurrency=4`. It is safe for your data and your machine, but it is more aggressive than most runs need. It is not recommended as a first run.
+
+**What can't go wrong**
+- Nothing is lost if it overloads. Each finished site is saved to the cache, and `--retry-failed` redoes the failures.
+- Memory stays bounded. Browser pages are capped at 4 at once, whatever the other numbers are.
+- It respects `robots.txt`, and 4 requests at a time to one server is gentle for any single host.
+
+**What can go wrong**
+- The peak is `concurrency × page-concurrency`, which is 24 × 4 = 96 requests in flight at once. Home routers, VPNs and Wi-Fi often struggle past roughly 50–100. That shows up as spurious `unreachable` or `timeout` failures and slower crawls.
+- The per-server cap counts hostnames, not shared platforms. Hundreds of dealer sites run on the same platforms and CDNs, so those providers can still see a burst. Some rate-limit or block it, and blocked sites then look like "no emails found".
+- Heavily loaded sites hit the per-site budget (`--budget`, 20 minutes by default) sooner and return partial results, so you can get fewer emails.
+
+**Recommended approach:** start with a moderate setting and watch the first file's failure counts in `emails/logs/<name>.log`. Raise the numbers only if the failures stay low.
+
+```bash
+npm run scrape -- --concurrency=16 --page-concurrency=3 --host-concurrency=3
+```
+
+If failures are high, lower the numbers, or run `--retry-failed` afterwards.
 
 Examples:
 
@@ -239,6 +264,11 @@ After a run finishes:
 - `emails/<name>.csv` holds the results.
 - `emails/logs/<name>.log` holds the summary: websites with emails, failures by reason, unique emails, and name breakdown.
 - If many sites failed with `unreachable` or `timeout` (often network hiccups), run `npm run scrape -- websites/<name>.csv --retry-failed`.
+- If failures read `browserType.launch: Executable doesn't exist …`, Playwright's Chromium isn't installed, or doesn't match the installed Playwright version. Every site that needs the browser fallback then fails. Fix it with the command below, then rerun with `--retry-failed`:
+
+  ```bash
+  npx playwright install chromium
+  ```
 
 ## Running the Australian lists
 
@@ -367,8 +397,6 @@ Most limits are command-line options; see [Crawl options](#crawl-options-depth-a
 |---|---|---|---|
 | `DEFAULT_OPTIONS` / `QUICK_OPTIONS` | `src/crawler.ts` | 400/60/unlimited/20 min · 150/30/unlimited/10 min | Pages, browser pages, max depth, soft budget |
 | `HARD_TIMEOUT_EXTRA_MS` | `src/index.ts` | 4 min | Hard safety timeout per site = budget + this |
-| `PAGE_CONCURRENCY` | `src/crawler.ts` | 3 | Parallel requests within one site |
-| `HOST_CONCURRENCY` | `src/crawler.ts` | 3 | Parallel requests to one server across all sites |
 | `HTTP_TIMEOUT` | `src/crawler.ts` | 15 s | Per-request timeout |
 | `MAX_BYTES` | `src/crawler.ts` | 5 MB | Max page size |
 

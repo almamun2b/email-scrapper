@@ -30,7 +30,7 @@ Standard procedure:
 | Re-scrape only failed sites | `npm run scrape -- --retry-failed` |
 | Rebuild CSVs and logs from cache, no network | `npm run scrape -- --summary-only` |
 | Lighter, faster crawl (150 pages, 10 min/site) | `npm run scrape -- --quick` |
-| Tune limits (any combination) | `--max-pages=N --browser-pages=N --max-depth=N --budget=MIN --concurrency=N` |
+| Tune limits (any combination) | `--max-pages=N --browser-pages=N --max-depth=N --budget=MIN --concurrency=N --page-concurrency=N --host-concurrency=N` |
 
 Deep crawl is the default: 400 pages, 60 browser pages, unlimited depth (`--max-depth=0`), 20 min per site. Use it for dealer, tourism and other large-site lists. Use `--quick` only when the owner wants speed over coverage. All flags are documented in README.md under "Crawl options".
 

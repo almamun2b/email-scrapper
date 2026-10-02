@@ -86,7 +86,7 @@ interface FoundOnPage {
 - `httpFetcher` uses Node's `fetch`, follows redirects, streams the body up to 5 MB and rejects non-HTML content types.
 - `makeBrowserFetcher()` uses Playwright Chromium. One shared browser runs across the whole process, with a new context per site and at most 4 pages at a time globally (`browserLimit`). Images, fonts and media are blocked. Each page waits for `domcontentloaded` and then briefly for `networkidle`.
 
-**HTTP politeness.** `httpGet()` goes through a per-server `p-limit(HOST_CONCURRENCY=3)` keyed by `baseHost`. Many input domains can redirect to one server (for example the NZ health boards all go to healthnz.govt.nz), so the limit is per server, not per site. A 429/503 response or a network error returns `'retry'`, and the request is retried once after 3 s.
+**HTTP politeness.** `httpGet()` goes through a per-server `p-limit(hostConcurrency)` (`--host-concurrency`, default 3) keyed by `baseHost`. Many input domains can redirect to one server (for example the NZ health boards all go to healthnz.govt.nz), so the limit is per server, not per site. A 429/503 response or a network error returns `'retry'`, and the request is retried once after 3 s.
 
 **`crawl()` algorithm:**
 1. Load robots for the start origin. If the start URL is disallowed, return `blocked`.

@@ -68,14 +68,14 @@ export interface CrawlOptions {
   browserPages: number; // headless-browser pages (phase 2)
   maxDepth: number;
   budgetMs: number; // soft budget; partial results are kept when it runs out
+  pageConcurrency: number; // parallel page requests within one site (HTTP phase)
 }
 
-export const DEFAULT_OPTIONS: CrawlOptions = { maxPages: 400, browserPages: 60, maxDepth: 0, budgetMs: 20 * 60_000 };
-export const QUICK_OPTIONS: CrawlOptions = { maxPages: 150, browserPages: 30, maxDepth: 0, budgetMs: 10 * 60_000 };
+export const DEFAULT_OPTIONS: CrawlOptions = { maxPages: 400, browserPages: 60, maxDepth: 0, budgetMs: 20 * 60_000, pageConcurrency: 3 };
+export const QUICK_OPTIONS: CrawlOptions = { maxPages: 150, browserPages: 30, maxDepth: 0, budgetMs: 10 * 60_000, pageConcurrency: 3 };
 
 const HTTP_TIMEOUT = 15_000;
 const MAX_BYTES = 5 * 1024 * 1024;
-const PAGE_CONCURRENCY = 3;
 
 interface Fetched {
   html: string;
@@ -87,13 +87,18 @@ type Fetcher = (url: string) => Promise<Fetched | null>;
 
 // Caps concurrent requests to one server across all sites crawled in parallel
 // (many input domains can redirect to the same host).
-const HOST_CONCURRENCY = 3;
+let hostConcurrency = 3;
 const hostLimits = new Map<string, ReturnType<typeof pLimit>>();
+
+/** Set before the first request: limiters already created keep their size. */
+export function setHostConcurrency(n: number): void {
+  hostConcurrency = Math.max(1, n);
+}
 
 function hostLimit(url: string): ReturnType<typeof pLimit> {
   const host = baseHost(new URL(url).hostname);
   let l = hostLimits.get(host);
-  if (!l) hostLimits.set(host, (l = pLimit(HOST_CONCURRENCY)));
+  if (!l) hostLimits.set(host, (l = pLimit(hostConcurrency)));
   return l;
 }
 
@@ -311,7 +316,7 @@ async function crawl(
 
   const depthOf = new Map<string, number>();
   let inflight = 0;
-  const workers = Array.from({ length: opts.concurrency ?? PAGE_CONCURRENCY }, async () => {
+  const workers = Array.from({ length: opts.concurrency ?? 3 }, async () => {
     for (;;) {
       if (pages >= maxPages || (opts.deadline && Date.now() > opts.deadline)) return;
       queue.sort((a, b) => a.pri - b.pri);
@@ -373,7 +378,7 @@ export async function scrapeSite(site: string, options: Partial<CrawlOptions> = 
   // --- Phase 1: plain HTTP ---
   let httpOut: CrawlOut | null = null;
   for (const start of candidateStarts(site)) {
-    const out = await crawl(start, httpFetcher, opt.maxPages, { useSitemap: true, deadline, maxDepth: opt.maxDepth });
+    const out = await crawl(start, httpFetcher, opt.maxPages, { useSitemap: true, deadline, maxDepth: opt.maxDepth, concurrency: opt.pageConcurrency });
     if (out.blocked) {
       result.error = 'robots-disallowed';
       if (out.home) result.finalUrl = out.home.url;
@@ -415,7 +420,8 @@ export async function scrapeSite(site: string, options: Partial<CrawlOptions> = 
         for (const [e, h] of out.emails) merge(all, e, h);
       }
     } catch (e) {
-      result.error = String((e as Error).message ?? e);
+      // first line only: Playwright errors (e.g. browser not installed) are multi-line banners
+      result.error = String((e as Error).message ?? e).split('\n')[0].trim();
     } finally {
       await close();
     }
