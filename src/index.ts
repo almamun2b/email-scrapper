@@ -4,13 +4,14 @@ import { parse } from 'csv-parse/sync';
 import { stringify } from 'csv-stringify/sync';
 import pLimit from 'p-limit';
 import { closeBrowser, DEFAULT_OPTIONS, QUICK_OPTIONS, scrapeSite, setHostConcurrency, type CrawlOptions, type SiteResult } from './crawler.js';
+import { initFileLogging, installProcessHandlers, log, LOG_DIR, parseLevel, runId, withLogContext } from './logger.js';
 import { baseHost, normalizeInput } from './urls.js';
 
 const ROOT = path.resolve(import.meta.dirname, '..');
 const IN_DIR = path.join(ROOT, 'websites');
 const OUT_DIR = path.join(ROOT, 'emails');
 const CACHE_DIR = path.join(OUT_DIR, '.cache');
-const LOG_DIR = path.join(OUT_DIR, 'logs');
+const SUMMARY_DIR = path.join(OUT_DIR, 'logs'); // per-file run summaries; diagnostics go to <root>/logs
 const HARD_TIMEOUT_EXTRA_MS = 4 * 60_000; // hard safety net on top of scrapeSite's soft budget, which keeps partial results
 
 interface RunOptions extends CrawlOptions {
@@ -42,10 +43,21 @@ function readSites(file: string): string[] {
   return out;
 }
 
-function withTimeout<T>(p: Promise<T>, ms: number, fallback: () => T): Promise<T> {
+/** Resolves with fallback(reason) on timeout or rejection, so one broken site never stops the run. */
+function withTimeout<T>(p: Promise<T>, ms: number, fallback: (reason: 'timeout' | 'internal-error') => T): Promise<T> {
   return new Promise((resolve) => {
-    const t = setTimeout(() => resolve(fallback()), ms);
-    p.then((v) => { clearTimeout(t); resolve(v); }, () => { clearTimeout(t); resolve(fallback()); });
+    const t = setTimeout(() => {
+      log.warn({ timeoutMs: ms }, 'site hit the hard timeout; its partial results are lost');
+      resolve(fallback('timeout'));
+    }, ms);
+    p.then(
+      (v) => { clearTimeout(t); resolve(v); },
+      (err) => {
+        clearTimeout(t);
+        log.error({ err }, 'site scrape crashed');
+        resolve(fallback('internal-error'));
+      },
+    );
   });
 }
 
@@ -92,9 +104,9 @@ function writeSummary(base: string, sites: string[], done: Map<string, SiteResul
   if (failed.length) lines.push(`  Failed sites:\n${failed.map((r) => `    - ${host(r)} [${r.error}]`).join('\n')}`);
   if (noEmails.length) lines.push(`  No emails found on:\n${noEmails.map((r) => `    - ${host(r)}`).join('\n')}`);
   const text = lines.join('\n') + '\n';
-  fs.mkdirSync(LOG_DIR, { recursive: true });
-  fs.appendFileSync(path.join(LOG_DIR, `${base}.log`), text + '\n');
-  console.log('\n' + text);
+  fs.mkdirSync(SUMMARY_DIR, { recursive: true });
+  fs.appendFileSync(path.join(SUMMARY_DIR, `${base}.log`), text + '\n');
+  log.info({ sites: sites.length, withEmails: withEmails.length, noEmails: noEmails.length, failed: failed.length, uniqueEmails, failures: Object.fromEntries(reasons) }, '\n' + text);
 }
 
 async function processFile(file: string, opts: RunOptions, retryFailed: boolean, summaryOnly = false): Promise<void> {
@@ -110,36 +122,40 @@ async function processFile(file: string, opts: RunOptions, retryFailed: boolean,
   // (no output CSV yet); a fresh scrape of an already-finished file starts the cache over.
   if (fs.existsSync(outFile) && fs.existsSync(cacheFile) && !retryFailed && !summaryOnly) fs.rmSync(cacheFile);
   if (fs.existsSync(cacheFile)) {
-    for (const line of fs.readFileSync(cacheFile, 'utf8').split('\n')) {
+    for (const [i, line] of fs.readFileSync(cacheFile, 'utf8').split('\n').entries()) {
       if (!line.trim()) continue;
       try {
         const r = JSON.parse(line) as SiteResult;
         if (retryFailed && r.error) continue; // re-scrape failed sites only
         done.set(r.site, r);
-      } catch { /* ignore */ }
+      } catch (err) {
+        log.warn({ err, cacheFile: path.relative(ROOT, cacheFile), line: i + 1 }, 'skipping corrupt cache line (site will be re-scraped)');
+      }
     }
   }
   if (retryFailed) fs.writeFileSync(cacheFile, [...done.values()].map((r) => JSON.stringify(r) + '\n').join(''));
-  console.log(`\n=== ${base}: ${sites.length} sites (${done.size} cached) ===`);
+  log.info({ input: path.relative(ROOT, file), sites: sites.length, cached: done.size }, `\n=== ${base}: ${sites.length} sites (${done.size} cached) ===`);
 
   let n = done.size;
   const limit = pLimit(opts.concurrency);
   await Promise.all(
     sites.map((site) =>
-      limit(async () => {
+      limit(() => withLogContext({ site }, async () => {
         if (done.has(site) || summaryOnly) return;
         const t0 = Date.now();
-        const r = await withTimeout(scrapeSite(site, opts), opts.budgetMs + HARD_TIMEOUT_EXTRA_MS, () => ({
-          site, finalUrl: site, business: baseHost(new URL(site).hostname), emails: [], pages: 0, usedBrowser: false, error: 'timeout',
+        log.debug('site started');
+        const r = await withTimeout(scrapeSite(site, opts), opts.budgetMs + HARD_TIMEOUT_EXTRA_MS, (error) => ({
+          site, finalUrl: site, business: baseHost(new URL(site).hostname), emails: [], pages: 0, usedBrowser: false, error,
         } as SiteResult));
         done.set(site, r);
         fs.appendFileSync(cacheFile, JSON.stringify(r) + '\n');
         n++;
-        const secs = ((Date.now() - t0) / 1000).toFixed(0);
-        console.log(
-          `[${n}/${sites.length}] ${baseHost(new URL(site).hostname)} — ${r.emails.length} emails, ${r.pages} pages${r.usedBrowser ? ', browser' : ''}${r.error ? `, ${r.error}` : ''} (${secs}s)`,
-        );
-      }),
+        const ms = Date.now() - t0;
+        const fields = { finalUrl: r.finalUrl, emails: r.emails.length, pages: r.pages, usedBrowser: r.usedBrowser, error: r.error, durationMs: ms };
+        const msg = `[${n}/${sites.length}] ${baseHost(new URL(site).hostname)} — ${r.emails.length} emails, ${r.pages} pages${r.usedBrowser ? ', browser' : ''}${r.error ? `, ${r.error}` : ''} (${(ms / 1000).toFixed(0)}s)`;
+        if (r.error && !r.emails.length) log.warn(fields, msg);
+        else log.info(fields, msg);
+      })),
     ),
   );
 
@@ -159,33 +175,43 @@ async function processFile(file: string, opts: RunOptions, retryFailed: boolean,
   }
   fs.writeFileSync(outFile, stringify(rows, { header: true, columns: ['name', 'email', 'website', 'link'] }));
   const withEmails = sites.filter((s) => (done.get(s)?.emails.length ?? 0) > 0).length;
-  console.log(`=> ${path.relative(ROOT, outFile)}: ${rows.length} emails from ${withEmails}/${sites.length} sites (${failed} failed/unreachable)`);
+  log.info({ output: path.relative(ROOT, outFile), emails: rows.length, withEmails, failed }, `=> ${path.relative(ROOT, outFile)}: ${rows.length} emails from ${withEmails}/${sites.length} sites (${failed} failed/unreachable)`);
   const mode = summaryOnly ? 'summary rebuilt from cache' : `${retryFailed ? 'retry-failed' : 'scrape'}: ${describe(opts)}`;
   writeSummary(base, sites, done, rows.length, mode, startedAt);
 }
 
 const NUMERIC_FLAGS = ['max-pages', 'browser-pages', 'max-depth', 'budget', 'concurrency', 'page-concurrency', 'host-concurrency'];
+const STRING_FLAGS = ['log-level'];
 
-/** Splits argv into flags and file paths. Numeric flags accept `--x=N` and `--x N`. */
-function parseArgs(argv: string[]): { flags: Set<string>; values: Map<string, number>; files: string[] } {
+/** Splits argv into flags and file paths. Value flags accept `--x=V` and `--x V`. */
+function parseArgs(argv: string[]): { flags: Set<string>; values: Map<string, number>; strings: Map<string, string>; files: string[] } {
   const flags = new Set<string>();
   const values = new Map<string, number>();
+  const strings = new Map<string, string>();
   const files: string[] = [];
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
     if (!a.startsWith('--')) { files.push(a); continue; }
     const [name, inline] = a.slice(2).split('=', 2);
+    if (STRING_FLAGS.includes(name)) {
+      const raw = inline ?? argv[++i];
+      if (!raw) throw new Error(`--${name} needs a value`);
+      strings.set(name, raw);
+      continue;
+    }
     if (!NUMERIC_FLAGS.includes(name)) { flags.add(name); continue; }
     const raw = inline ?? argv[++i];
     const n = Number(raw);
     if (raw === undefined || !Number.isFinite(n) || n < 0) throw new Error(`--${name} needs a number, got "${raw ?? ''}"`);
     values.set(name, n);
   }
-  return { flags, values, files };
+  return { flags, values, strings, files };
 }
 
 async function main() {
-  const { flags, values, files: fileArgs } = parseArgs(process.argv.slice(2));
+  const startedAt = Date.now();
+  const { flags, values, strings, files: fileArgs } = parseArgs(process.argv.slice(2));
+  initFileLogging(parseLevel(strings.get('log-level')) ?? parseLevel(process.env.LOG_LEVEL) ?? 'info');
   const force = flags.has('force');
   const retryFailed = flags.has('retry-failed');
   const summaryOnly = flags.has('summary-only'); // rebuild CSV + summary log from the cache, no scraping
@@ -202,7 +228,8 @@ async function main() {
   const unknown = [...flags].filter((f) => !['force', 'retry-failed', 'summary-only', 'quick'].includes(f));
   if (unknown.length) throw new Error(`Unknown option(s): ${unknown.map((f) => '--' + f).join(', ')}`);
   setHostConcurrency(opts.hostConcurrency);
-  if (!summaryOnly) console.log(`Crawl options: ${describe(opts)}`);
+  log.info({ argv: process.argv.slice(2), options: opts, node: process.version, logDir: path.relative(ROOT, LOG_DIR) }, `Run ${runId} started (pid ${process.pid})`);
+  if (!summaryOnly) log.info(`Crawl options: ${describe(opts)}`);
   const files = fileArgs.map((f) => path.resolve(f));
   const targets = files.length
     ? files
@@ -210,15 +237,24 @@ async function main() {
 
   fs.mkdirSync(OUT_DIR, { recursive: true });
   for (const f of targets) {
-    if (!fs.existsSync(f)) { console.error(`Not found: ${f}`); continue; }
+    if (!fs.existsSync(f)) { log.error({ input: f }, `Not found: ${f}`); continue; }
     const out = path.join(OUT_DIR, path.basename(f, path.extname(f)) + '.csv');
     if (!files.length && !force && !retryFailed && !summaryOnly && fs.existsSync(out)) {
-      console.log(`Skipping ${path.basename(f)} (output exists; use --force)`);
+      log.info({ input: path.relative(ROOT, f) }, `Skipping ${path.basename(f)} (output exists; use --force)`);
       continue;
     }
-    await processFile(f, opts, retryFailed, summaryOnly);
+    const base = path.basename(f, path.extname(f));
+    await withLogContext({ file: base }, () => processFile(f, opts, retryFailed, summaryOnly));
   }
   await closeBrowser();
+  log.info({ durationMs: Date.now() - startedAt }, `Run ${runId} finished in ${fmtDuration(Date.now() - startedAt)}`);
 }
 
-main().then(() => process.exit(0), (e) => { console.error(e); process.exit(1); });
+installProcessHandlers(closeBrowser);
+main().then(
+  () => process.exit(0),
+  (err) => {
+    log.fatal({ err }, 'run failed');
+    process.exit(1);
+  },
+);

@@ -15,7 +15,7 @@ Standard procedure:
    ```
    Plain `npm run scrape` processes every input file that has no output yet.
 3. Watch progress in the log. Each site prints `[n/N] host — X emails, Y pages …`. The run for a file ends with a `=>` line and the summary block.
-4. Report per-file totals from the summary: websites with emails, websites with no emails, failed websites grouped by reason, unique emails, and name breakdown. Mention noteworthy failures.
+4. Report per-file totals from the summary: websites with emails, websites with no emails, failed websites grouped by reason, unique emails, and name breakdown. Mention noteworthy failures. Check `logs/error-<date>.log` (JSON lines, `npx pino-pretty < file` to read) and report any errors from the run (match its `runId`). For a site that failed for unclear reasons, re-run it alone with `--log-level=debug`.
 5. If many sites fail with transient errors, offer `npm run scrape -- --retry-failed`. It re-crawls only failed sites and keeps everything else.
 
 ## Commands
@@ -29,6 +29,7 @@ Standard procedure:
 | Re-scrape everything | `npm run scrape -- --force` |
 | Re-scrape only failed sites | `npm run scrape -- --retry-failed` |
 | Rebuild CSVs and logs from cache, no network | `npm run scrape -- --summary-only` |
+| Verbose diagnostics in `logs/` | `npm run scrape -- websites/a.csv --log-level=debug` |
 | Lighter, faster crawl (150 pages, 10 min/site) | `npm run scrape -- --quick` |
 | Tune limits (any combination) | `--max-pages=N --browser-pages=N --max-depth=N --budget=MIN --concurrency=N --page-concurrency=N --host-concurrency=N` |
 
@@ -62,6 +63,7 @@ For an end-to-end check, write a 2–4 row sample CSV outside `websites/` and ru
 ## Process hygiene
 
 - Long runs go in the background with `nohup … &`. Wait on the **PID** (`while kill -0 <pid>; do sleep 30; done`).
+- To stop a run, `kill` the PID printed in its first log line (`Run <id> started (pid N)`). Killing the `npm` PID does not reach the scraper and leaves it running.
 - **Never** wait with `pgrep -f` or kill with `pkill -f` using a pattern that also appears in your own shell command. It matches itself, so the wait never ends or the kill takes out your own shell. This has happened here before.
 - Before starting a new run, make sure no other scrape of the same file is running. Two runs appending to one cache file will corrupt the resume logic.
 - If a run is interrupted, re-running the same command resumes from the cache. Don't delete the partial cache.

@@ -17,6 +17,7 @@ npm run scrape -- --force                        # re-scrape everything
 npm run scrape -- --retry-failed                 # re-crawl only failed sites, reuse cache for the rest
 npm run scrape -- --summary-only                 # rebuild CSVs + logs from cache, no network
 npm run scrape -- --quick                        # lighter crawl (150 pages, 10 min/site); default is deep
+npm run scrape -- x.csv --log-level=debug        # also log every failed request to logs/scraper-<date>.log
 npm run scrape -- x.csv --max-pages=600 --max-depth=3 --budget=30 --browser-pages=80 --concurrency=8 --page-concurrency=3 --host-concurrency=3
 ```
 
@@ -50,3 +51,5 @@ Pipeline: `index.ts` (per-file orchestration) → `crawler.ts` `scrapeSite()` (p
 - Never delete `emails/.cache/`, and don't re-scrape existing outputs unless asked (see AGENTS.md).
 - When waiting on a background scrape, poll by PID. `pgrep -f`/`pkill -f` patterns that appear in your own command line match your own shell.
 - `websites/`, `emails/` and `logs` are git-ignored.
+- Diagnostics go through `log` from `src/logger.ts` (pino), not `console`. Root `logs/scraper-<date>.log` holds JSON lines, `logs/error-<date>.log` holds error+fatal only. Use `withLogContext()` for per-file/per-site fields. `emails/logs/<name>.log` is the separate human summary.
+- cheerio pulls in npm `undici`, which takes over global `fetch`. Always consume or `cancel()` a response body: an abandoned body on a server-closed connection throws an uncatchable `AssertionError` in undici's `Parser.finish` and used to crash whole runs.

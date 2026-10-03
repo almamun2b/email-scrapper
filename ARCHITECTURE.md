@@ -15,7 +15,7 @@ websites/<name>.csv
 │        withTimeout(scrapeSite(site, opts), budget + 4 min)    │
 │        append SiteResult → .cache/<name>.jsonl                │
 │    build CSV (input order, unique by email)                   │
-│    writeSummary() → console + emails/logs/<name>.log          │
+│    writeSummary() → log + emails/logs/<name>.log              │
 └───────────────────────────────────────────────────────────────┘
         │ scrapeSite(site)
         ▼
@@ -38,7 +38,7 @@ websites/<name>.csv
 └───────────────────────────────────────────────────────────────┘
 ```
 
-Everything runs in a single Node.js process. TypeScript is executed directly with `tsx`; there is no build step (`tsconfig.json` has `noEmit`). The package is ESM (`"type": "module"`), so imports between source files use `.js` extensions.
+Everything runs in a single Node.js process. TypeScript is executed directly by `node --import tsx` (a loader, not the `tsx` CLI, whose signal relay SIGKILLs a busy child before its shutdown handler runs); there is no build step (`tsconfig.json` has `noEmit`). The package is ESM (`"type": "module"`), so imports between source files use `.js` extensions.
 
 ## Core data types
 
@@ -76,7 +76,7 @@ interface FoundOnPage {
   - The cache is **never deleted after a successful run**. The user relies on it for later analysis.
 - **Options:** `parseArgs()` splits argv into boolean flags, numeric options (`--x=N` or `--x N`) and file paths. Unknown flags are an error. `RunOptions` starts from `DEFAULT_OPTIONS` (deep) or `QUICK_OPTIONS` (`--quick`), and explicit options override it. The options are printed at start and included in the summary's mode string.
 - **Input dedupe:** `readSites()` keys rows on `baseHost(host) + path` (trailing slash stripped). `www.` duplicates of a domain merge, while several dealer pages on one group domain stay separate sites.
-- **Concurrency:** `--concurrency` sites at once (12). Each site is wrapped in a hard timeout of `budget + 4 min` (24 min by default) that yields an empty `error: 'timeout'` result. `scrapeSite` normally stops itself at the soft budget (20 min by default) and keeps partial results.
+- **Concurrency:** `--concurrency` sites at once (12). Each site is wrapped in a hard timeout of `budget + 4 min` (24 min by default) that yields an empty `error: 'timeout'` result. If `scrapeSite` rejects, the error is logged with its stack and the site gets `error: 'internal-error'`, so the rest of the run continues. `scrapeSite` normally stops itself at the soft budget (20 min by default) and keeps partial results.
 - **CSV:** rows are built in input order and are unique by email across the whole file (first site wins). `name = e.name || e.pageTitle || r.business`. The columns are fixed: `name,email,website,link`.
 - **Summary:** `writeSummary()` prints the summary and appends it to `emails/logs/<name>.log`. It counts sites with emails, sites with no emails, failed sites grouped by reason, partial results, name-source breakdown, and top sites.
 
@@ -86,7 +86,9 @@ interface FoundOnPage {
 - `httpFetcher` uses Node's `fetch`, follows redirects, streams the body up to 5 MB and rejects non-HTML content types.
 - `makeBrowserFetcher()` uses Playwright Chromium. One shared browser runs across the whole process, with a new context per site and at most 4 pages at a time globally (`browserLimit`). Images, fonts and media are blocked. Each page waits for `domcontentloaded` and then briefly for `networkidle`.
 
-**HTTP politeness.** `httpGet()` goes through a per-server `p-limit(hostConcurrency)` (`--host-concurrency`, default 3) keyed by `baseHost`. Many input domains can redirect to one server (for example the NZ health boards all go to healthnz.govt.nz), so the limit is per server, not per site. A 429/503 response or a network error returns `'retry'`, and the request is retried once after 3 s.
+**HTTP politeness.** `httpGet()` goes through a per-server `p-limit(hostConcurrency)` (`--host-concurrency`, default 3) keyed by `baseHost`. Many input domains can redirect to one server (for example the NZ health boards all go to healthnz.govt.nz), so the limit is per server, not per site. A 429/503 response or a network error returns a `Retry`, and the request is retried once after 3 s.
+
+**Response bodies must always be consumed or cancelled.** `cheerio` imports npm `undici`, which installs its own `Agent` as the global dispatcher, so Node's built-in `fetch` runs through `node_modules/undici`. If a body is left unread and the server closes the connection, undici throws `AssertionError` in `Parser.finish` from a socket event. That is uncatchable at the call site and used to kill the whole run. `httpGetOnce()` therefore calls `res.body.cancel()` on every non-OK response and `reader.cancel()` on oversize pages. As a backstop, the process handler in `logger.ts` logs that specific assertion and keeps running.
 
 **`crawl()` algorithm:**
 1. Load robots for the start origin. If the start URL is disallowed, return `blocked`.
@@ -117,6 +119,20 @@ interface FoundOnPage {
 **Merging hits:** `merge()` keeps the first page an email was seen on and replaces it only if a later hit supplies a person name. The same rule applies within a crawl and across the two phases.
 
 **Department titles:** `ingest()` computes `pageTitleOf(html)` (`<h1>`, else the first segment of `<title>`) only when the crawl has a section and the page is inside it but isn't the landing page itself.
+
+### `src/logger.ts` — diagnostics
+
+- **One pino logger (`log`)** writes to a `pino.multistream`:
+  - At import it has only a `pino-pretty` console stream (info+, message only, no object fields). Scratch scripts that import `crawler.ts` therefore never write files.
+  - `initFileLogging(level)`, called from `main()`, adds `logs/scraper-<date>.log` (at `--log-level` / `LOG_LEVEL`, default info) and `logs/error-<date>.log` (error+). Both are JSON lines written with `sync: true`, so nothing is lost on `process.exit` or a crash.
+  - It also deletes this logger's own files older than `LOG_RETENTION_DAYS` (30).
+- **Context:** `withLogContext(fields, fn)` stores fields in an `AsyncLocalStorage`. pino's `mixin` adds them to every line. `index.ts` wraps each file (`file`) and each site (`site`), so lines from deep inside `httpGet()` carry the site without passing a logger around. This works because p-limit preserves async context (it registers `.then` in the caller's context). Lines from the shared `robots.txt` cache carry the context of the first site that requested it.
+- **`installProcessHandlers()`:**
+  - `uncaughtException` and `unhandledRejection` are logged as `fatal`, then the process exits with code 1. The undici parser assertion above is the one exception: it is logged as `error` and the run continues.
+  - Node `warning`s are logged as `warn`.
+  - SIGINT and SIGTERM close the browser and exit with 130/143.
+- **What is logged where:** run, file and site lifecycle at info. Failed sites, exhausted rate-limit retries and hard timeouts at warn. Browser launch failures and site crashes at error. Every individual request failure (status, network error code, timeout) at debug.
+- **Separate from the summaries:** `emails/logs/<name>.log` (the human summary per input file) is separate and unchanged.
 
 ### `src/extract.ts` — emails and names
 
@@ -172,6 +188,7 @@ interface FoundOnPage {
 | Append-only JSONL cache, kept forever | Crash-safe resume, cheap `--retry-failed` / `--summary-only`, and data for later heuristic tuning |
 | One row per email per file | Aggregator sites repeat the same addresses. Output is a contact list, not a page index |
 | Conservative person naming | A wrong person name is worse than a business name. Names must be consistent with the local part |
+| pino JSON-lines logs in `logs/`, synchronous writes | Owner decision (2026-10-03). Machine-filterable (`jq`, log shippers), and crash-safe. The console stays human-readable via pino-pretty |
 
 ## Extending
 
@@ -179,4 +196,4 @@ interface FoundOnPage {
 - **New email source or obfuscation:** add it in `extractFromHtml()` or `deobfuscate()`, and route every candidate through `cleanEmail()`.
 - **New junk pattern:** extend `JUNK_DOMAINS`, `JUNK_LOCAL`, `BAD_TLD_SUFFIX` or `GTLDS` in `extract.ts`.
 - **Crawl scope:** change `SKIP_EXT`, `SKIP_PATH`, `PRIORITY_PATH`, `LISTING_SEGMENT` in `urls.ts`, or `DEFAULT_OPTIONS`/`QUICK_OPTIONS` in `crawler.ts`.
-- **New CLI flag:** boolean flags go in the known-flags list in `main()`, numeric ones in `NUMERIC_FLAGS`. Parse it in `main()` and pass it into `processFile()`. Keep the rule that the CSV and summary are derived from the `done` map, so every mode produces consistent outputs.
+- **New CLI flag:** boolean flags go in the known-flags list in `main()`, numeric ones in `NUMERIC_FLAGS`, string ones in `STRING_FLAGS`. Parse it in `main()` and pass it into `processFile()`. Keep the rule that the CSV and summary are derived from the `done` map, so every mode produces consistent outputs.

@@ -4,6 +4,7 @@ import { chromium, type Browser } from 'playwright';
 import pLimit from 'p-limit';
 import { baseHost, canonical, crawlable, inSection, priority, sectionPrefix } from './urls.js';
 import { businessName, extractFromHtml, looksJsRendered, type Found } from './extract.js';
+import { log } from './logger.js';
 
 export interface FoundOnPage extends Found {
   link: string; // page the email was found on
@@ -106,14 +107,20 @@ type HttpResult = { body: string; url: string; type: string };
 
 async function httpGet(url: string, accept = 'text/html,application/xhtml+xml,*/*;q=0.8'): Promise<HttpResult | null> {
   const first = await hostLimit(url)(() => httpGetOnce(url, accept));
-  if (first !== 'retry') return first;
+  if (!(first instanceof Retry)) return first;
   await new Promise((r) => setTimeout(r, 3_000));
   const second = await hostLimit(url)(() => httpGetOnce(url, accept));
-  return second === 'retry' ? null : second;
+  if (!(second instanceof Retry)) return second;
+  if (second.status) log.warn({ url, status: second.status }, `still HTTP ${second.status} after retry (rate limited)`);
+  return null;
 }
 
-/** 'retry' for rate limiting (429/503) and network errors, null for other failures. */
-async function httpGetOnce(url: string, accept: string): Promise<HttpResult | null | 'retry'> {
+/** Worth one more try: rate limiting (status 429/503) or a network error (no status). */
+class Retry {
+  constructor(readonly status?: number) {}
+}
+
+async function httpGetOnce(url: string, accept: string): Promise<HttpResult | null | Retry> {
   const ctl = new AbortController();
   const timer = setTimeout(() => ctl.abort(), HTTP_TIMEOUT);
   try {
@@ -122,8 +129,13 @@ async function httpGetOnce(url: string, accept: string): Promise<HttpResult | nu
       redirect: 'follow',
       headers: { 'user-agent': UA, accept, 'accept-language': 'en-AU,en-NZ;q=0.9,en;q=0.8' },
     });
-    if (res.status === 429 || res.status === 503) return 'retry';
-    if (!res.ok) return null;
+    if (!res.ok) {
+      // Always release an unread body: cheerio loads npm undici, which then backs global fetch, and
+      // an abandoned body on a connection the server closes crashes the process (undici Parser.finish assertion).
+      await res.body?.cancel().catch(() => {});
+      log.debug({ url, status: res.status }, `HTTP ${res.status}`);
+      return res.status === 429 || res.status === 503 ? new Retry(res.status) : null;
+    }
     const type = res.headers.get('content-type') ?? '';
     if (!res.body) return null;
     const reader = res.body.getReader();
@@ -134,11 +146,21 @@ async function httpGetOnce(url: string, accept: string): Promise<HttpResult | nu
       if (done) break;
       total += value.length;
       chunks.push(value);
-      if (total > MAX_BYTES) { ctl.abort(); break; }
+      if (total > MAX_BYTES) {
+        log.debug({ url, bytes: total }, 'response too large, truncated');
+        await reader.cancel().catch(() => {});
+        ctl.abort();
+        break;
+      }
     }
     return { body: Buffer.concat(chunks).toString('utf8'), url: res.url || url, type };
-  } catch {
-    return ctl.signal.aborted ? null : 'retry';
+  } catch (err) {
+    if (ctl.signal.aborted) {
+      log.debug({ url, timeoutMs: HTTP_TIMEOUT }, 'request timed out');
+      return null;
+    }
+    log.debug({ url, err }, 'network error');
+    return new Retry();
   } finally {
     clearTimeout(timer);
   }
@@ -152,6 +174,11 @@ const httpFetcher: Fetcher = async (url) => {
 };
 
 // ---------------- Browser ----------------
+
+/** First line only: Playwright errors (e.g. browser not installed) are multi-line banners. */
+function firstLine(e: unknown): string {
+  return String((e as Error)?.message ?? e).split('\n')[0].trim();
+}
 
 let browserPromise: Promise<Browser> | null = null;
 const browserLimit = pLimit(4);
@@ -192,7 +219,8 @@ function makeBrowserFetcher(): { fetcher: Fetcher; close: () => Promise<void> } 
         await page.waitForLoadState('networkidle', { timeout: 6_000 }).catch(() => {});
         const html = await page.content();
         return { html, url: page.url() };
-      } catch {
+      } catch (err) {
+        log.debug({ url, err: firstLine(err) }, 'browser page failed');
         return null;
       } finally {
         await page.close().catch(() => {});
@@ -267,7 +295,10 @@ async function crawl(
   let section: string | null = null;
   let landingKey = '';
 
-  if (!allowed(robots, start)) return { emails, pages: 0, home: null, blocked: true };
+  if (!allowed(robots, start)) {
+    log.info({ url: start }, `robots.txt disallows ${start}`);
+    return { emails, pages: 0, home: null, blocked: true };
+  }
 
   const enqueue = (u: URL, depth: number) => {
     if (opts.maxDepth && depth > opts.maxDepth) return;
@@ -281,14 +312,20 @@ async function crawl(
 
   // homepage first (sequential so we know the final host)
   const first = await fetcher(start);
-  if (!first) return { emails, pages: 0, home: null };
+  if (!first) {
+    log.debug({ url: start }, 'start URL unreachable');
+    return { emails, pages: 0, home: null };
+  }
   pages++;
   const landing = new URL(first.url);
   host = landing.hostname;
   // A redirect to another server means that server's robots.txt applies.
   if (landing.origin !== new URL(start).origin) {
     robots = await loadRobots(landing.origin);
-    if (!allowed(robots, first.url)) return { emails, pages, home: first, blocked: true };
+    if (!allowed(robots, first.url)) {
+      log.info({ url: first.url, start }, `robots.txt disallows ${first.url} (redirected from ${start})`);
+      return { emails, pages, home: first, blocked: true };
+    }
   }
   section = sectionPrefix(new URL(start), landing);
   landingKey = canonical(landing);
@@ -305,7 +342,10 @@ async function crawl(
   ingest(first.html, first.url);
   for (const l of collectLinks(first.html, first.url)) enqueue(l, 1);
   if (opts.useSitemap) {
-    const sm = await loadSitemapUrls(landing.origin, robots?.getSitemaps() ?? []).catch(() => []);
+    const sm = await loadSitemapUrls(landing.origin, robots?.getSitemaps() ?? []).catch((err) => {
+      log.debug({ err }, 'sitemap load failed');
+      return [];
+    });
     for (const s of sm) {
       try {
         const u = new URL(s);
@@ -316,9 +356,11 @@ async function crawl(
 
   const depthOf = new Map<string, number>();
   let inflight = 0;
+  let outOfTime = false;
   const workers = Array.from({ length: opts.concurrency ?? 3 }, async () => {
     for (;;) {
-      if (pages >= maxPages || (opts.deadline && Date.now() > opts.deadline)) return;
+      if (opts.deadline && Date.now() > opts.deadline) { outOfTime = true; return; }
+      if (pages >= maxPages) return;
       queue.sort((a, b) => a.pri - b.pri);
       const item = queue.shift();
       if (!item) {
@@ -345,6 +387,7 @@ async function crawl(
     }
   });
   await Promise.all(workers);
+  if (outOfTime) log.info({ pages, emails: emails.size, queued: queue.length }, 'site time budget reached, keeping partial results');
   return { emails, pages, home: first };
 }
 
@@ -419,9 +462,9 @@ export async function scrapeSite(site: string, options: Partial<CrawlOptions> = 
         }
         for (const [e, h] of out.emails) merge(all, e, h);
       }
-    } catch (e) {
-      // first line only: Playwright errors (e.g. browser not installed) are multi-line banners
-      result.error = String((e as Error).message ?? e).split('\n')[0].trim();
+    } catch (err) {
+      result.error = firstLine(err);
+      log.error({ err }, 'headless browser phase failed');
     } finally {
       await close();
     }

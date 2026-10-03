@@ -24,6 +24,7 @@ Built with TypeScript on Node.js. It uses [cheerio](https://cheerio.js.org/) to 
 - [Running long jobs](#running-long-jobs)
 - [Running the Australian lists](#running-the-australian-lists)
 - [Summary logs](#summary-logs)
+- [Diagnostic logs](#diagnostic-logs)
 - [Cache and resuming](#cache-and-resuming)
 - [How it works](#how-it-works)
 - [Tuning](#tuning)
@@ -117,6 +118,7 @@ Rules:
 | `npm run scrape -- --retry-failed` | Re-scrape only sites that failed last time (unreachable, timeout, …). Successful sites are reused from the cache. Rebuilds the CSVs and logs |
 | `npm run scrape -- --summary-only` | Scrape nothing. Rebuild the CSVs and summary logs from the cache |
 | `npm run scrape -- --quick` | Lighter, faster crawl (150 pages, 10 min per site). See [Crawl options](#crawl-options-depth-and-limits) |
+| `npm run scrape -- --log-level=debug` | Also write every failed request, timeout and robots decision to `logs/`. See [Diagnostic logs](#diagnostic-logs) |
 | `npm run typecheck` | Type-check the project with `tsc --noEmit` |
 
 The `--` after `npm run scrape` is required. It passes everything after it to the scraper.
@@ -252,17 +254,20 @@ Check whether it is still running (replace `12345` with the PID):
 kill -0 12345 && echo running || echo finished
 ```
 
-Stop it (the cache keeps every site that already finished):
+Stop it (the cache keeps every site that already finished). `$!` is the PID of `npm`, and npm does not pass the signal on to the scraper, so stop the scraper process itself. Its PID is printed in the first line of the log: `Run 6696978c started (pid 23456)`.
 
 ```bash
-kill 12345
+kill 23456
 ```
+
+The scraper logs `SIGTERM received, shutting down`, closes the headless browser and exits. Stopping only the `npm` PID leaves the scraper running in the background.
 
 **Resume** after a stop, crash or reboot: run exactly the same command again. Sites already in `emails/.cache/<name>.jsonl` are skipped. Don't run two scrapes of the same file at the same time, because they would both append to one cache file.
 
 After a run finishes:
 - `emails/<name>.csv` holds the results.
 - `emails/logs/<name>.log` holds the summary: websites with emails, failures by reason, unique emails, and name breakdown.
+- `logs/error-<date>.log` lists every error from the run with its stack trace. If it's empty, nothing went wrong internally. See [Diagnostic logs](#diagnostic-logs).
 - If many sites failed with `unreachable` or `timeout` (often network hiccups), run `npm run scrape -- websites/<name>.csv --retry-failed`.
 - If failures read `browserType.launch: Executable doesn't exist …`, Playwright's Chromium isn't installed, or doesn't match the installed Playwright version. Every site that needs the browser fallback then fails. Fix it with the command below, then rerun with `--retry-failed`:
 
@@ -329,8 +334,49 @@ Failure reasons:
 | `unreachable` | The site didn't respond (DNS failure, connection refused, TLS error, or every start URL failed) |
 | `robots-disallowed` | The site's `robots.txt` (on the host reached after redirects) forbids crawling it |
 | `timeout` | The site exceeded the hard safety limit (the `--budget` plus 4 minutes; 24 minutes by default) |
+| `internal-error` | The scraper itself crashed on this site. The stack trace is in `logs/error-<date>.log` |
 
 "No emails found" means the site was crawled successfully but publishes no email address. Often it only has a contact form.
+
+## Diagnostic logs
+
+Besides the per-file summaries, every run writes structured diagnostic logs with [pino](https://getpino.io) to the root `logs/` folder (git-ignored):
+
+| File | Contents |
+|---|---|
+| `logs/scraper-YYYY-MM-DD.log` | Every event at or above the log level (default `info`): run start and options, each file, each finished site with its counts and timing, warnings, errors |
+| `logs/error-YYYY-MM-DD.log` | Only `error` and `fatal` events, with full stack traces. Check this first after a run |
+
+- **Format:** one JSON object per line. Every line has `time`, `level` (`20` debug, `30` info, `40` warn, `50` error, `60` fatal), `msg` and `runId`. That makes it easy to separate overlapping runs. Lines logged while a file or site is being processed also carry `file` and `site`.
+- **Rotation and retention:** a new file is started for each day, named by the run's start date. Files older than 30 days are deleted at startup. Change the period with `LOG_RETENTION_DAYS=N`; `0` keeps them forever. Only `scraper-*.log` and `error-*.log` are ever deleted, so your own `logs/run.log` from `nohup` is safe.
+- **Writes are synchronous,** so the last lines before a crash or `kill` are never lost.
+- **The terminal** shows a readable version of `info` and above: the usual `[n/N] host — …` progress lines, with warnings and errors highlighted.
+
+### Log levels
+
+`--log-level=<level>` (or the `LOG_LEVEL` environment variable; the flag wins) sets what goes into `scraper-*.log`. The levels are `trace`, `debug`, `info`, `warn`, `error`, `fatal` and `silent`.
+
+| Level | What is logged |
+|---|---|
+| `info` (default) | Run/file/site progress, robots.txt blocks, sites that ran out of time budget |
+| `warn` | Sites that failed with no emails, still rate-limited (429/503) after a retry, hard timeouts, corrupt cache lines, SIGINT/SIGTERM |
+| `error` | The headless browser failing to start, a site crashing the scraper, the undici socket assertion (see below) |
+| `fatal` | Uncaught exceptions and unhandled rejections; the process exits with code 1 |
+| `debug` | Every non-200 response, network error (with its `ECONNRESET`/`ENOTFOUND` code), request timeout, oversize page, failed browser page and sitemap failure. Verbose: use it to investigate a specific site |
+
+### Reading the logs
+
+```bash
+npx pino-pretty < logs/scraper-2026-10-03.log
+```
+
+```bash
+jq -c 'select(.level >= 40) | {time, site, msg, err: .err.message}' logs/scraper-2026-10-03.log
+```
+
+```bash
+jq -c 'select(.site == "https://example.co.nz/")' logs/scraper-2026-10-03.log
+```
 
 ## Cache and resuming
 
@@ -419,11 +465,13 @@ These are publicly published business contact details. If you use them for marke
 ```
 src/
   index.ts      CLI: input discovery, per-file orchestration, cache, CSV output, summary logs
+  logger.ts     pino logger: console + logs/*.log JSON files, per-site context, crash/signal handlers
   crawler.ts    Per-site crawl: HTTP + headless-browser fallback, robots.txt, rate limiting
   extract.ts    Email extraction, junk filtering, person/business name detection
   urls.ts       URL normalisation, crawlability rules, link priority, section detection
 websites/       Input CSVs (git-ignored)
 emails/         Output CSVs, logs/ and .cache/ (git-ignored)
+logs/           Diagnostic JSON logs: scraper-<date>.log, error-<date>.log (git-ignored)
 ```
 
 For internals, see [ARCHITECTURE.md](ARCHITECTURE.md).
