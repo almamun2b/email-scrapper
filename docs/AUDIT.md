@@ -1,6 +1,6 @@
 # Email Scraper: Code Audit
 
-**Date:** 2026-10-03
+**Date:** 2026-10-03 · **Fixes applied:** 2026-10-03 (see the Status column and [Fix notes](#fix-notes))
 **Scope:** all of `src/` (`index.ts`, `crawler.ts`, `extract.ts`, `urls.ts`, `logger.ts`), `package.json`, `tsconfig.json`, and the docs (README, ARCHITECTURE, AGENTS, CLAUDE). This covers the working tree, including the uncommitted logger/concurrency changes.
 
 ## How the audit was done
@@ -13,26 +13,26 @@
 
 ## Summary
 
-| ID | Severity | Area | Finding |
-|---|---|---|---|
-| H1 | High | Bug | A single link with a bad `%` escape crashes the whole site, and all of its emails are lost |
-| H2 | High | Perf / DoS | Quadratic regexes can freeze the entire process for minutes or hours on one page |
-| H3 | High | Data loss | Re-scraping an existing output deletes its cache first, so resume breaks and partial CSVs can follow |
-| H4 | High | Data loss | `--summary-only` with no cache overwrites a good CSV with an empty one |
-| H5 | High | Data quality | TLD check is too loose (ROT13 garbage passes) and too strict (`.travel`, `.cars`, `.auto` dropped) |
-| M1 | Medium | Data quality | `nameFromLocal()` invents person names like "Used Cars", "Customer Relations", "Hobart Parts" |
-| M2 | Medium | Data quality | `consistentPerson()` substring match accepts "Customer Care" for `gmsvcare@` |
-| M3 | Medium | Bug | Browser fallback never runs for `http://` inputs |
-| M4 | Medium | Resilience | A crashed or disconnected Chromium is never relaunched |
-| M5 | Medium | Resilience | The hard timeout doesn't cancel the scrape, which keeps running as a zombie |
-| M6 | Medium | Perf | Name lookup costs about 55 ms per email (`*:contains()` scan of the whole DOM) |
-| M7 | Medium | Security | CSV formula injection through scraped business names and page titles |
-| M8 | Medium | Security | Chromium runs with `--no-sandbox` on untrusted JavaScript |
-| M9 | Medium | Security | Redirects can reach localhost, LAN and cloud-metadata addresses (SSRF) |
-| M10 | Medium | Data loss | `--retry-failed` drops partial results and rewrites the cache non-atomically |
-| M11 | Medium | Ops | No lock against two runs on the same file |
-| M12 | Medium | UX | Unrecognised input headers silently yield 0 sites |
-| L1–L16 | Low | Various | See [Low severity](#low-severity) |
+| ID | Severity | Area | Finding | Status |
+|---|---|---|---|---|
+| H1 | High | Bug | A single link with a bad `%` escape crashes the whole site, and all of its emails are lost | Fixed |
+| H2 | High | Perf / DoS | Quadratic regexes can freeze the entire process for minutes or hours on one page | Fixed |
+| H3 | High | Data loss | Re-scraping an existing output deletes its cache first, so resume breaks and partial CSVs can follow | Fixed |
+| H4 | High | Data loss | `--summary-only` with no cache overwrites a good CSV with an empty one | Fixed |
+| H5 | High | Data quality | TLD check is too loose (ROT13 garbage passes) and too strict (`.travel`, `.cars`, `.auto` dropped) | Fixed |
+| M1 | Medium | Data quality | `nameFromLocal()` invents person names like "Used Cars", "Customer Relations", "Hobart Parts" | Fixed (see notes) |
+| M2 | Medium | Data quality | `consistentPerson()` substring match accepts "Customer Care" for `gmsvcare@` | Fixed |
+| M3 | Medium | Bug | Browser fallback never runs for `http://` inputs | Fixed |
+| M4 | Medium | Resilience | A crashed or disconnected Chromium is never relaunched | Fixed (no automated test) |
+| M5 | Medium | Resilience | The hard timeout doesn't cancel the scrape, which keeps running as a zombie | Fixed |
+| M6 | Medium | Perf | Name lookup costs about 55 ms per email (`*:contains()` scan of the whole DOM) | Fixed |
+| M7 | Medium | Security | CSV formula injection through scraped business names and page titles | Fixed |
+| M8 | Medium | Security | Chromium runs with `--no-sandbox` on untrusted JavaScript | Fixed |
+| M9 | Medium | Security | Redirects can reach localhost, LAN and cloud-metadata addresses (SSRF) | Fixed (see notes) |
+| M10 | Medium | Data loss | `--retry-failed` drops partial results and rewrites the cache non-atomically | Fixed |
+| M11 | Medium | Ops | No lock against two runs on the same file | Fixed |
+| M12 | Medium | UX | Unrecognised input headers silently yield 0 sites | Fixed |
+| L1–L16 | Low | Various | See [Low severity](#low-severity) | All fixed; L6 partly by decision (see notes) |
 
 Recommended order of work: **H1 → H2 → H3/H4 → H5 → M1/M2**, then add the [regression tests](#testing-the-biggest-gap) before tuning the heuristics further.
 
@@ -116,7 +116,7 @@ fcbegfzrq@z3pyvavp.pb.am         (ROT13 of …@m3clinic.co.nz)
 media@qldairports.com.ay         (typo TLD, undeliverable)
 ```
 
-**Too strict: real gTLDs outside the hand-picked list are dropped silently.** All of these return `null` today: `@rotorua.travel`, `@kiwi.cars`, `@dealer.auto`, `@shop.motors`, `@x.tours`, `@x.law`, `@b.global`, `@x.media`. These TLDs are common on exactly the dealer and tourism lists the tool now targets.
+**Too strict: real gTLDs outside the hand-picked list are dropped silently.** All of these return `null` today: `@rotorua.travel`, `@kiwi.cars`, `@dealer.auto`, `@x.tours`, `@x.law`, `@b.global`, `@x.media`. (An earlier version of this list also named `.motors`, which turned out not to be a delegated TLD.) These TLDs are common on exactly the dealer and tourism lists the tool now targets.
 
 **Fix:**
 - Validate against the real public suffix list. `tldts` is small, has no dependencies, and is maintained. Alternatively, embed the IANA TLD list.
@@ -302,3 +302,23 @@ Recommendations, cheapest first:
 - `emails/.cache/au.warner-bros-movie-world.jsonl` has 187 cached sites but no CSV or summary. That looks like an interrupted run. A plain `npm run scrape` will resume it, as long as H3 doesn't bite.
 - `websites/au.wet-n-wild.csv` and `websites/au.zeekr.csv` have no output yet.
 - Across the caches, `unreachable` is the dominant failure (about 120 sites), followed by `robots-disallowed` (5) and one `timeout`. No `internal-error` has occurred yet (see H1).
+
+---
+
+## Fix notes
+
+All findings were fixed on 2026-10-03, each with a test (`npm test`, 65 tests, no network). The plan was followed with these differences and remaining limits:
+
+- **Module layout.** `index.ts` runs `main()` on import, so its testable logic moved to `cli.ts`, `input.ts`, `cache.ts` and `output.ts`. `crawler.ts` was split into `http.ts`, `browser.ts`, `robots.ts`, `sitemap.ts` and the new `netguard.ts`. `crawler.ts` still exports `scrapeSite`, `closeBrowser` and `setHostConcurrency`.
+- **H5 / ROT13.** `.nz` scrambles to `.am`, a real TLD, so `x.pb.am` is also decoded when it unscrambles to a two-part suffix such as `.co.nz`. A genuine `info@hotel.am` is kept as is. On the existing caches, 15 rows decode (for example `jhabib@baycityautogroup.com.au`), 1 invalid-TLD row is dropped, and 1 decoded row merges with an address the site already had.
+- **M1.** The given-name list (`src/data/given-names.txt`) has about 3,250 names, fewer than the 5,000 planned. Names mined from the cache were too noisy to use directly ("carevets", "customer", "hobart"), so the list is hand-curated, plus the real first names found missing in a review of the caches. Three more rules came out of that review:
+  - names confirmed by the page are recorded (`nameFrom: 'page'`) and never second-guessed;
+  - `LOCAL_STOP` matches whole parts (it had rejected "caroline" for containing "line");
+  - `demoteRolePrefixes()` clears branch mailboxes such as BYD's 41 `bec.<city>@` addresses.
+
+  On the caches, the person name is removed from about 500 rows (about 170 distinct names), almost all non-people ("Used Cars", "Trade Res", "Customer Relations", "Bec Brisbane"). People whose first name isn't in the list now get the business name unless the page ties the name to the email. `scripts/given-names-report.ts` helps grow the list.
+- **`\n` escape artifacts (found while fixing).** JSON strings like `"\ndavid.xuereb@…"` produced the address `ndavid.xuereb@…`. `findEmails()` now drops such a prefix. Four such addresses in the existing caches can't be repaired from the cache and stay in the outputs until those sites are scraped again.
+- **M4** (Chromium relaunch after a crash) is implemented but has no automated test.
+- **M9.** The guard resolves each host before requesting it, so DNS rebinding (a host answering differently on the second lookup) is still possible in principle. Closing it fully would need a custom connector that pins the checked address.
+- **L6.** By the owner's decision the Chrome user agent stays. A robots.txt 5xx is a disallow, and Crawl-delay is honoured (capped at 10 s).
+- **Existing outputs** aren't rebuilt automatically. Run `npm run scrape -- --summary-only` to apply the new rules to them. `npx tsx scripts/recheck-cache.ts` previews the changes first.

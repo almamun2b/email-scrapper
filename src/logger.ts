@@ -18,16 +18,40 @@ export const LOG_DIR = path.resolve(import.meta.dirname, '..', 'logs');
 
 const context = new AsyncLocalStorage<Record<string, unknown>>();
 
+function hostOf(url: unknown): string | undefined {
+  try {
+    return new URL(String(url)).hostname.replace(/^www\./, '') || undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * The console line for a log record. Fields are hidden on the console, so the site's host is prefixed
+ * and the URL appended whenever the message doesn't already say them: "[aolimo.com.au] … — https://…".
+ */
+export function consoleMessage(log: Record<string, unknown>, messageKey = 'msg'): string {
+  let msg = String(log[messageKey] ?? '');
+  const host = hostOf(log.site);
+  if (host && !msg.includes(host)) msg = `[${host}] ${msg}`;
+  if (typeof log.url === 'string' && log.url !== log.site) {
+    let path = log.url;
+    try { path = new URL(log.url).pathname; } catch { /* keep */ }
+    if (!msg.includes(log.url) && (path === '/' || !msg.includes(path))) msg += ` — ${log.url}`;
+  }
+  const err = log.err as { message?: string; type?: string } | undefined;
+  // an assertion's message ("false == true") means nothing to a reader; the stack is in the log file
+  const first = err?.message?.split('\n')[0].trim(); // Playwright errors are multi-line banners
+  if (!first || err?.type === 'AssertionError' || msg.includes(first)) return msg;
+  return `${msg}: ${first}`;
+}
+
 const consoleStream = pretty({
   sync: true, // nothing lost when the process exits right after logging
   translateTime: 'SYS:HH:MM:ss',
   ignore: 'pid,hostname,runId',
   hideObject: true, // structured fields go to the files; the console shows the message only
-  messageFormat: (log, messageKey) => {
-    const msg = String(log[messageKey] ?? '');
-    const err = log.err as { message?: string } | undefined;
-    return err?.message && !msg.includes(err.message) ? `${msg}: ${err.message}` : msg;
-  },
+  messageFormat: (log, messageKey) => consoleMessage(log, messageKey),
 });
 
 const streams = pino.multistream([{ level: 'info', stream: consoleStream }]);
@@ -67,7 +91,7 @@ function pruneOldLogs(retentionDays: number): void {
     try {
       fs.rmSync(path.join(LOG_DIR, f));
     } catch (err) {
-      log.warn({ err, file: f }, 'could not delete old log file');
+      log.warn({ err, file: f }, `could not delete old log file ${f}`);
     }
   }
 }
@@ -92,6 +116,8 @@ export function initFileLogging(level: LevelWithSilent = 'info'): void {
  * undici (pulled in by cheerio, and then backing global fetch) can throw this assertion from a
  * socket 'end' handler when a response body is left unread. It only affects that one socket.
  */
+const closedSocketSites = new Set<unknown>();
+
 function isUndiciParserAssertion(err: unknown): boolean {
   const e = err as { code?: string; stack?: string } | null;
   return e?.code === 'ERR_ASSERTION' && /undici[\\/]lib[\\/]dispatcher/.test(e.stack ?? '');
@@ -101,7 +127,11 @@ function isUndiciParserAssertion(err: unknown): boolean {
 export function installProcessHandlers(onShutdown: () => Promise<void>): void {
   process.on('uncaughtException', (err, origin) => {
     if (isUndiciParserAssertion(err)) {
-      log.error({ err, origin }, 'undici parser assertion on a closed socket; continuing');
+      // Harmless: the request on that socket fails or times out like any other, so warn once per site.
+      const site = context.getStore()?.site;
+      const first = !closedSocketSites.has(site);
+      closedSocketSites.add(site);
+      log[first ? 'warn' : 'debug']({ err, origin }, 'a server closed the connection mid-response; that page was skipped (harmless)');
       return;
     }
     log.fatal({ err, origin }, 'uncaught exception, exiting');
@@ -111,7 +141,7 @@ export function installProcessHandlers(onShutdown: () => Promise<void>): void {
     log.fatal({ err: reason }, 'unhandled promise rejection, exiting');
     process.exit(1);
   });
-  process.on('warning', (w) => log.warn({ err: w }, `node warning: ${w.name}`));
+  process.on('warning', (w) => log.warn({ err: w }, `node warning: ${w.name}: ${w.message}`));
 
   let stopping = false;
   for (const [signal, code] of [['SIGINT', 130], ['SIGTERM', 143]] as const) {

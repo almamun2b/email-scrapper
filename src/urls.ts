@@ -1,3 +1,6 @@
+import { isIP } from 'node:net';
+import { parse as parseDomain } from 'tldts';
+
 const SKIP_EXT =
   /\.(pdf|docx?|xlsx?|pptx?|zip|rar|gz|7z|jpe?g|png|gif|svg|webp|avif|ico|bmp|tiff?|mp3|mp4|m4a|wav|avi|mov|wmv|webm|css|js|json|xml|rss|woff2?|ttf|eot|otf|exe|dmg|apk|csv|txt|ics)$/i;
 
@@ -12,13 +15,24 @@ const PRIORITY_PATH =
 const LISTING_SEGMENT =
   /^((new|used|demo|demonstrator|pre-owned|preowned)([-_]?(cars?|vehicles?|stock|inventory))?|stock|inventory|vehicles?|cars?|cars-for-sale|for-sale|search|listings?|showroom|offers?|specials?|news|blog|articles?|events?|products?)$/i;
 
+/**
+ * An input cell as a crawlable URL, or null. Repairs the "www./example.com" typo; rejects hosts with an
+ * empty label ("www.") or without a registrable domain under a real public suffix (IP addresses pass).
+ */
 export function normalizeInput(raw: string): string | null {
   let s = raw.trim().replace(/^["']|["']$/g, '');
   if (!s) return null;
+  s = s.replace(/^((?:https?:\/\/)?www)\.\/+/i, '$1.');
   if (!/^[a-z][a-z0-9+.-]*:\/\//i.test(s)) s = 'https://' + s;
   try {
     const u = new URL(s);
-    if (!/^https?:$/.test(u.protocol) || !u.hostname.includes('.')) return null;
+    if (!/^https?:$/.test(u.protocol)) return null;
+    const host = u.hostname;
+    if (!isIP(host.replace(/^\[|\]$/g, ''))) {
+      if (!host.includes('.') || host.split('.').some((l) => !l)) return null;
+      const d = parseDomain(host, { allowPrivateDomains: false });
+      if (!d.domain || d.isIcann !== true) return null;
+    }
     return u.toString();
   } catch {
     return null;
@@ -85,7 +99,10 @@ export function sectionPrefix(input: URL, landing: URL): string | null {
 
 /** Lower = fetched sooner. */
 export function priority(url: URL, depth: number, section?: string | null): number {
-  const p = decodeURIComponent(url.pathname);
+  let p = url.pathname;
+  try {
+    p = decodeURIComponent(p);
+  } catch { /* URL keeps invalid escapes like "/100%-off" as-is */ }
   const hit = PRIORITY_PATH.test(p);
   const strong = /(contact|get-in-touch|enquir|find-us|about|team|staff|meet)/i.test(p);
   const sectionAdj = section ? (inSection(url, section) ? -20 : 15) : 0;
