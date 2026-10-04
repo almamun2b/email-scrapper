@@ -32,6 +32,8 @@ Standard procedure:
 | Re-scrape everything | `npm run scrape -- --force` |
 | Re-scrape only failed sites | `npm run scrape -- --retry-failed` |
 | Rebuild CSVs and logs from cache with the current rules, no network | `npm run scrape -- --summary-only` |
+| One list with each email once across all outputs, no network (`emails/unique/all.csv`) | `npm run scrape -- --unique` |
+| Same for only some files (`emails/unique/au.csv`) | `npm run scrape -- --unique websites/au.*.csv` |
 | Verbose diagnostics in `logs/` | `npm run scrape -- websites/a.csv --log-level=debug` |
 | Lighter, faster crawl (150 pages, 10 min/site) | `npm run scrape -- --quick` |
 | Tune limits (any combination) | `--max-pages=N --browser-pages=N --max-depth=N --budget=MIN --concurrency=N --page-concurrency=N --host-concurrency=N` |

@@ -18,6 +18,8 @@ npm run scrape -- websites/x.csv                 # specific file(s); always re-s
 npm run scrape -- --force                        # re-scrape everything
 npm run scrape -- --retry-failed                 # re-crawl only failed or rate-limited sites, reuse cache for the rest
 npm run scrape -- --summary-only                 # rebuild CSVs + logs from cache with current rules, no network
+npm run scrape -- --unique                       # each email once across all emails/*.csv -> emails/unique/all.csv; no network
+npm run scrape -- --unique websites/au.*.csv     # only those files -> emails/unique/au.csv
 npm run scrape -- --quick                        # lighter crawl (150 pages, 10 min/site); default is deep
 npm run scrape -- x.csv --log-level=debug        # also log every failed request to logs/scraper-<date>.log
 npm run scrape -- x.csv --max-pages=600 --max-depth=3 --budget=30 --browser-pages=80 --concurrency=8 --page-concurrency=3 --host-concurrency=3
@@ -45,7 +47,7 @@ Pipeline: `index.ts` (per-file orchestration; helpers in `cli.ts`, `input.ts`, `
   - A global browser page limit of 4.
   - Each site has a soft budget (`--budget`, 20 min) that keeps partial results, plus a hard timeout of budget + 4 min in `index.ts` that aborts the site's `AbortSignal` and still keeps what it found.
 - **Naming precedence:** `name || pageTitle || business`. Person names are deliberately conservative. `consistentPerson()` keeps a scraped name only if it matches whole tokens of the email's local part (or it has a title like Dr). `nameFromLocal()` needs a first part from `src/data/given-names.txt` and no `DEPT_WORDS`. `demoteRolePrefixes()` clears per-branch role mailboxes (`bec.<city>@`). A wrong person name is considered worse than a business name.
-- **CSV rows are unique by email per file**, in input-site order (first site wins). `link` is the first page the email was seen on, upgraded only to a page that yields a person name (`merge()`).
+- **CSV rows are unique by email per file**, in input-site order (first site wins). Across files they repeat when input lists overlap; `--unique` (`uniqueRows()` in `output.ts`) writes the combined list. `link` is the first page the email was seen on, upgraded only to a page that yields a person name (`merge()`).
 
 ## Gotchas
 

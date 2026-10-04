@@ -43,3 +43,35 @@ export function buildRows(sites: string[], done: Map<string, SiteResult>): Row[]
   }
   return rows;
 }
+
+/**
+ * One row per email across several output CSVs (input lists overlap, so the same address shows up in many
+ * files). Files are taken in the given order and the first occurrence wins, like buildRows within one file.
+ */
+export function uniqueRows(files: { base: string; rows: Row[] }[]): { rows: Row[]; read: number; overlaps: Map<string, number> } {
+  const rows: Row[] = [];
+  const firstIn = new Map<string, string>();
+  const overlaps = new Map<string, number>(); // "later file ← first file" → duplicates dropped
+  let read = 0;
+  for (const f of files) {
+    for (const row of f.rows) {
+      read++;
+      const key = row[1].trim().toLowerCase();
+      const first = firstIn.get(key);
+      if (first !== undefined) {
+        if (first !== f.base) overlaps.set(`${f.base} ← ${first}`, (overlaps.get(`${f.base} ← ${first}`) ?? 0) + 1);
+        continue;
+      }
+      firstIn.set(key, f.base);
+      rows.push(row);
+    }
+  }
+  return { rows, read, overlaps };
+}
+
+/** Name for a combined file: the prefix all base names share before their first `.`, `_` or `-` (`au.x`, `au.y` → `au`), else `all`. */
+export function uniqueLabel(bases: string[]): string {
+  const heads = new Set(bases.map((b) => b.split(/[._-]/)[0]));
+  const [head] = heads;
+  return heads.size === 1 && head ? head : 'all';
+}

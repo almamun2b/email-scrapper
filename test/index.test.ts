@@ -7,7 +7,7 @@ import { acquireLock, beginScrape, cacheFiles, endScrape, ensureTrailingNewline,
 import { parseArgs, rawFlag } from '../src/cli.js';
 import type { SiteResult } from '../src/crawler.js';
 import { readSites } from '../src/input.js';
-import { buildRows, safeCell } from '../src/output.js';
+import { buildRows, safeCell, uniqueLabel, uniqueRows } from '../src/output.js';
 
 const tmp = () => fs.mkdtempSync(path.join(os.tmpdir(), 'scraper-test-'));
 const site = (s: string, extra: Partial<SiteResult> = {}): SiteResult => ({
@@ -199,4 +199,29 @@ test('buildRows: input order, unique by email, name fallback, formula-safe', () 
     ["'=evil()", 'x@a.nz', 'https://a.nz/', 'l1'],
     ['Cardiology', 'y@b.nz', 'https://b.nz/', 'l3'],
   ]);
+});
+
+// ---------- --unique ----------
+
+test('parseArgs accepts --unique', () => {
+  assert.ok(parseArgs(['--unique', 'websites/au.a.csv']).flags.has('unique'));
+  assert.throws(() => parseArgs(['--unique=1']), /takes no value/);
+});
+
+test('uniqueRows keeps each email once across files, first file wins, case-insensitive', () => {
+  const { rows, read, overlaps } = uniqueRows([
+    { base: 'au.a', rows: [['A', 'x@a.com', 'https://a.com/', ''], ['B', 'y@a.com', 'https://a.com/', '']] },
+    { base: 'au.b', rows: [['Other', 'X@A.com ', 'https://b.com/', ''], ['C', 'z@b.com', 'https://b.com/', '']] },
+    { base: 'au.c', rows: [['D', 'y@a.com', 'https://c.com/', ''], ['E', 'z@b.com', 'https://c.com/', '']] },
+  ]);
+  assert.equal(read, 6);
+  assert.deepEqual(rows.map((r) => [r[0], r[1]]), [['A', 'x@a.com'], ['B', 'y@a.com'], ['C', 'z@b.com']]);
+  assert.deepEqual(Object.fromEntries(overlaps), { 'au.b ← au.a': 1, 'au.c ← au.a': 1, 'au.c ← au.b': 1 });
+});
+
+test('uniqueLabel names the combined file after the shared prefix', () => {
+  assert.equal(uniqueLabel(['au.ford', 'au.kia']), 'au');
+  assert.equal(uniqueLabel(['nz_dentists_all', 'nz_hospitals_all']), 'nz');
+  assert.equal(uniqueLabel(['au.ford', 'nz_dentists_all']), 'all');
+  assert.equal(uniqueLabel(['clinics']), 'clinics');
 });

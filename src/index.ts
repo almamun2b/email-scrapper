@@ -1,5 +1,6 @@
 import fs from 'node:fs';
 import path from 'node:path';
+import { parse } from 'csv-parse/sync';
 import { stringify } from 'csv-stringify/sync';
 import pLimit from 'p-limit';
 import type { LevelWithSilent } from 'pino';
@@ -8,7 +9,7 @@ import { parseArgs, rawFlag } from './cli.js';
 import { CACHE_VERSION, closeBrowser, DEFAULT_OPTIONS, QUICK_OPTIONS, scrapeSite, setHostConcurrency, type CrawlOptions, type SiteResult } from './crawler.js';
 import { readSites } from './input.js';
 import { initFileLogging, installProcessHandlers, log, LOG_DIR, parseLevel, runId, withLogContext } from './logger.js';
-import { buildRows, recheckSite } from './output.js';
+import { buildRows, recheckSite, uniqueLabel, uniqueRows, type Row } from './output.js';
 import { baseHost } from './urls.js';
 
 const ROOT = path.resolve(import.meta.dirname, '..');
@@ -218,6 +219,43 @@ async function processFile(file: string, opts: RunOptions, retryFailed: boolean,
   }
 }
 
+/**
+ * --unique: every email once across the given output CSVs, written to emails/unique/<label>.csv.
+ * Reads finished outputs only; per-file CSVs and caches are left alone and nothing is scraped.
+ */
+function writeUnique(bases: string[]): void {
+  const startedAt = Date.now();
+  const files: { base: string; rows: Row[] }[] = [];
+  const missing: string[] = [];
+  for (const base of [...bases].sort()) {
+    const f = path.join(OUT_DIR, `${base}.csv`);
+    if (!fs.existsSync(f)) { missing.push(base); continue; }
+    const rows = parse(fs.readFileSync(f), { columns: true, skip_empty_lines: true, bom: true }) as Record<string, string>[];
+    files.push({ base, rows: rows.filter((r) => r.email).map((r) => [r.name ?? '', r.email, r.website ?? '', r.link ?? '']) });
+  }
+  if (missing.length) log.warn({ missing }, `--unique: no output yet for ${missing.join(', ')}; skipped`);
+  if (!files.length) { log.warn('--unique: no output CSVs to combine'); return; }
+
+  const label = uniqueLabel(files.map((f) => f.base));
+  const outFile = path.join(OUT_DIR, 'unique', `${label}.csv`);
+  const { rows, read, overlaps } = uniqueRows(files);
+  fs.mkdirSync(path.dirname(outFile), { recursive: true });
+  fs.writeFileSync(outFile, stringify(rows, { header: true, columns: ['name', 'email', 'website', 'link'] }));
+
+  const top = [...overlaps].sort((a, b) => b[1] - a[1]).slice(0, 5);
+  const text = [
+    `=== unique ${label} — ${new Date(startedAt).toISOString()} (run ${runId}) ===`,
+    `  Files    : ${files.length} (${files.map((f) => `${f.base} ${f.rows.length}`).join(', ')})`,
+    `  Rows     : ${read} read, ${read - rows.length} duplicate(s) removed`,
+    `  Emails   : ${rows.length} unique -> ${path.relative(ROOT, outFile)}`,
+    ...(top.length ? [`  Overlap  : ${top.map(([k, n]) => `${k} ${n}`).join('; ')}`] : []),
+    '',
+  ].join('\n');
+  fs.mkdirSync(SUMMARY_DIR, { recursive: true });
+  fs.appendFileSync(path.join(SUMMARY_DIR, `unique.${label}.log`), text + '\n');
+  log.info({ output: path.relative(ROOT, outFile), files: files.length, rowsRead: read, uniqueEmails: rows.length }, '\n' + text);
+}
+
 async function main() {
   const startedAt = Date.now();
   const argv = process.argv.slice(2);
@@ -235,6 +273,15 @@ async function main() {
   const force = flags.has('force');
   const retryFailed = flags.has('retry-failed');
   const summaryOnly = flags.has('summary-only'); // rebuild CSV + summary log from the cache, no scraping
+  if (flags.has('unique')) {
+    const other = ['force', 'retry-failed', 'summary-only', 'quick'].filter((f) => flags.has(f));
+    if (other.length) throw new Error(`--unique only combines existing outputs; it can't be used with --${other.join(', --')}`);
+    const bases = fileArgs.length
+      ? fileArgs.map((f) => path.basename(f, path.extname(f)))
+      : (fs.existsSync(OUT_DIR) ? fs.readdirSync(OUT_DIR) : []).filter((f) => f.toLowerCase().endsWith('.csv')).map((f) => path.basename(f, path.extname(f)));
+    writeUnique([...new Set(bases)]);
+    return;
+  }
   const base = flags.has('quick') ? QUICK_OPTIONS : DEFAULT_OPTIONS;
   const opts: RunOptions = {
     maxPages: values.get('max-pages') ?? base.maxPages,

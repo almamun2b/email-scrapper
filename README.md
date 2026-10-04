@@ -114,6 +114,17 @@ Rules:
 - If an email appears on several pages, `link` is the first page it was seen on. A later page wins only if it ties the email to a person name.
 - A `name` that starts with `=`, `+`, `-` or `@` is prefixed with `'`, so a hostile page title can't become a live formula in Excel or Google Sheets.
 
+### Unique emails across files
+
+Each file is unique on its own, but the same email often appears in several files when the input lists overlap (the three theme-park lists share most of their websites). `--unique` combines existing outputs into one list with every email once. It scrapes nothing and leaves the per-file CSVs alone:
+
+```bash
+npm run scrape -- --unique                     # all emails/*.csv  -> emails/unique/all.csv
+npm run scrape -- --unique websites/au.*.csv   # only those files  -> emails/unique/au.csv
+```
+
+The file name is the prefix the input names share before their first `.`, `_` or `-` (`au.*` → `au`, `nz_*` → `nz`), or `all`. Columns are the same `name,email,website,link`. When an email is in several files, the row from the first file alphabetically is kept. A summary (files, rows read, duplicates removed, most-overlapping files) is appended to `emails/logs/unique.<prefix>.log`.
+
 ## Command reference
 
 | Command | What it does |
@@ -123,6 +134,8 @@ Rules:
 | `npm run scrape -- --force` | Re-scrape all files in `websites/` from scratch |
 | `npm run scrape -- --retry-failed` | Re-scrape only sites that failed with no emails (unreachable, timeout, …) or had pages skipped by rate limiting. The existing cache is reused as is, and everything else is kept, including `robots-disallowed` sites. A retried site that comes back with fewer emails keeps its earlier result. Rebuilds the CSVs and logs |
 | `npm run scrape -- --summary-only` | Scrape nothing. Rebuild the CSVs and summary logs from the cache, applying the current email and name rules. Skips (and leaves untouched) a file with no cache or an interrupted scrape |
+| `npm run scrape -- --unique` | Scrape nothing. Combine every `emails/*.csv` into `emails/unique/all.csv` with each email once. See [Unique emails across files](#unique-emails-across-files) |
+| `npm run scrape -- --unique websites/au.*.csv` | Same, for only the named files: writes `emails/unique/au.csv` |
 | `npm run scrape -- --quick` | Lighter, faster crawl (150 pages, 10 min per site). See [Crawl options](#crawl-options-depth-and-limits) |
 | `npm run scrape -- --log-level=debug` | Also write every failed request, timeout and robots decision to `logs/`. See [Diagnostic logs](#diagnostic-logs) |
 | `npm run typecheck` | Type-check the project with `tsc --noEmit` |
@@ -274,6 +287,7 @@ The scraper logs `SIGTERM received, shutting down`, closes the headless browser 
 After a run finishes:
 - `emails/<name>.csv` holds the results.
 - `emails/logs/<name>.log` holds the summary: websites with emails, failures by reason, unique emails, and name breakdown.
+- Emails are unique within each file. For one list without repeats across files, run `npm run scrape -- --unique websites/au.*.csv` (writes `emails/unique/au.csv`).
 - `logs/error-<date>.log` lists every error from the run with its stack trace. If it's empty, nothing went wrong internally. See [Diagnostic logs](#diagnostic-logs).
 - If many sites failed with `unreachable` or `timeout` (often network hiccups), run `npm run scrape -- websites/<name>.csv --retry-failed`.
 - If failures read `browserType.launch: Executable doesn't exist …`, Playwright's Chromium isn't installed, or doesn't match the installed Playwright version. Every site that needs the browser fallback then fails. Fix it with the command below, then rerun with `--retry-failed`:
@@ -313,6 +327,12 @@ Rebuild the CSVs and logs from the cache without touching the network:
 
 ```bash
 npm run scrape -- websites/au.*.csv --summary-only
+```
+
+Combine all AU outputs into one list with each email once (`emails/unique/au.csv`), see [Unique emails across files](#unique-emails-across-files):
+
+```bash
+npm run scrape -- --unique websites/au.*.csv
 ```
 
 Note that `npm run scrape -- websites/au.*.csv` always re-scrapes the files named. A plain `npm run scrape` would also pick up any `websites/*.csv` that has no output yet. Dealer sites are big, so expect roughly 1–2 hours per 150 sites with the default deep crawl. For a faster first pass, add `--quick`.

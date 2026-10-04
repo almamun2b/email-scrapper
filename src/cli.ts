@@ -1,4 +1,4 @@
-export const BOOLEAN_FLAGS = ['force', 'retry-failed', 'summary-only', 'quick'];
+export const BOOLEAN_FLAGS = ['force', 'retry-failed', 'summary-only', 'quick', 'unique'];
 export const INTEGER_FLAGS = ['max-pages', 'browser-pages', 'max-depth', 'concurrency', 'page-concurrency', 'host-concurrency'];
 export const NUMBER_FLAGS = ['budget']; // minutes, may be fractional
 export const STRING_FLAGS = ['log-level'];
