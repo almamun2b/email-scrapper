@@ -3,7 +3,7 @@ import path from 'node:path';
 import { stringify } from 'csv-stringify/sync';
 import pLimit from 'p-limit';
 import type { LevelWithSilent } from 'pino';
-import { acquireLock, beginScrape, cacheFiles, endScrape, isRetryable, loadCache, LockedError, writeCacheAtomic } from './cache.js';
+import { acquireLock, beginScrape, cacheFiles, endScrape, ensureTrailingNewline, isRetryable, loadCache, LockedError, writeCacheAtomic } from './cache.js';
 import { parseArgs, rawFlag } from './cli.js';
 import { CACHE_VERSION, closeBrowser, DEFAULT_OPTIONS, QUICK_OPTIONS, scrapeSite, setHostConcurrency, type CrawlOptions, type SiteResult } from './crawler.js';
 import { readSites } from './input.js';
@@ -161,6 +161,7 @@ async function processFile(file: string, opts: RunOptions, retryFailed: boolean,
       const { resumed, rotatedTo } = beginScrape(cf, fs.existsSync(outFile), retryFailed);
       if (resumed) log.info({ cacheFile: rel(cf.cache) }, `${base}: resuming an interrupted scrape from the cache`);
       if (rotatedTo) log.info({ previousCache: rel(rotatedTo) }, `${base}: previous cache kept as ${rel(rotatedTo)}`);
+      ensureTrailingNewline(cf.cache);
     }
     const done = loadCache(cf.cache);
     // Results being retried that found emails: a retry that finds fewer (rate-limited again) keeps these.

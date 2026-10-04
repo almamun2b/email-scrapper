@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { acquireLock, beginScrape, cacheFiles, endScrape, isRetryable, loadCache, LockedError, writeCacheAtomic } from '../src/cache.js';
+import { acquireLock, beginScrape, cacheFiles, endScrape, ensureTrailingNewline, isRetryable, loadCache, LockedError, writeCacheAtomic } from '../src/cache.js';
 import { parseArgs, rawFlag } from '../src/cli.js';
 import type { SiteResult } from '../src/crawler.js';
 import { readSites } from '../src/input.js';
@@ -124,6 +124,32 @@ test('loadCache skips corrupt lines', () => {
   const files = cacheFiles(tmp(), 'x');
   fs.writeFileSync(files.cache, JSON.stringify(site('https://a.nz/')) + '\n{"site":"htt\n');
   assert.equal(loadCache(files.cache).size, 1);
+});
+
+test('loadCache recovers records glued onto one line by an interrupted run', () => {
+  const files = cacheFiles(tmp(), 'x');
+  const a = JSON.stringify(site('https://a.nz/', { business: 'Shop } {"x"' }));
+  const b = JSON.stringify(site('https://b.nz/'));
+  const c = JSON.stringify(site('https://c.nz/'));
+  fs.writeFileSync(files.cache, `${a}${b}\n${c}\0\0\0${a.replace('a.nz', 'd.nz')}\n{"site":"htt${b.replace('b.nz', 'e.nz')}\n`);
+  assert.deepEqual([...loadCache(files.cache).keys()].sort(), ['https://a.nz/', 'https://b.nz/', 'https://c.nz/', 'https://d.nz/', 'https://e.nz/']);
+});
+
+test('ensureTrailingNewline keeps the next append on its own line', () => {
+  const files = cacheFiles(tmp(), 'x');
+  ensureTrailingNewline(files.cache); // missing file: no-op
+  assert.ok(!fs.existsSync(files.cache));
+  fs.writeFileSync(files.cache, '');
+  ensureTrailingNewline(files.cache);
+  assert.equal(fs.readFileSync(files.cache, 'utf8'), '');
+  const a = JSON.stringify(site('https://a.nz/'));
+  fs.writeFileSync(files.cache, a); // cut off before its newline
+  ensureTrailingNewline(files.cache);
+  ensureTrailingNewline(files.cache); // already ends in \n: no-op
+  fs.appendFileSync(files.cache, JSON.stringify(site('https://b.nz/')) + '\n');
+  const lines = fs.readFileSync(files.cache, 'utf8').split('\n').filter(Boolean);
+  assert.equal(lines.length, 2);
+  for (const l of lines) JSON.parse(l);
 });
 
 test('isRetryable: failures with no emails and rate-limited sites, never robots blocks (M10)', () => {

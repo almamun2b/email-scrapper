@@ -24,7 +24,15 @@ export function cacheFiles(cacheDir: string, base: string): CacheFiles {
   };
 }
 
-/** Cached results by site; corrupt lines are skipped (those sites get scraped again). */
+/**
+ * A run cut off at the wrong moment can leave the last record unfinished or without its newline (or followed
+ * by NUL bytes after an unclean shutdown), and the next run's append then lands on the same line. Every record
+ * starts with `{"v":` (older ones with `{"site":`). That can't occur inside a record: a quote in a string is
+ * escaped, and nested objects have other keys. So it marks where the next record begins.
+ */
+const RECORD_START = /(?=\{"(?:v|site)":)/;
+
+/** Cached results by site; unreadable records are skipped (those sites get scraped again). */
 export function loadCache(file: string): Map<string, SiteResult> {
   const done = new Map<string, SiteResult>();
   if (!fs.existsSync(file)) return done;
@@ -33,11 +41,36 @@ export function loadCache(file: string): Map<string, SiteResult> {
     try {
       const r = JSON.parse(line) as SiteResult;
       done.set(r.site, r);
-    } catch (err) {
-      log.warn({ err, cacheFile: file, line: i + 1 }, `skipping unreadable line ${i + 1} of ${path.basename(file)}; that site will be scraped again`);
+      continue;
+    } catch {
+      // fall through: salvage the records glued together on this line
+    }
+    for (const part of line.replace(/\0+/g, '').split(RECORD_START)) {
+      if (!part.trim()) continue;
+      try {
+        const r = JSON.parse(part) as SiteResult;
+        done.set(r.site, r);
+      } catch (err) {
+        log.warn({ err, cacheFile: file, line: i + 1 }, `skipping an unreadable record on line ${i + 1} of ${path.basename(file)}; its site will be scraped again`);
+      }
     }
   }
   return done;
+}
+
+/** Makes sure the next append starts on a fresh line, even if an interrupted run left the last one unfinished. */
+export function ensureTrailingNewline(file: string): void {
+  if (!fs.existsSync(file)) return;
+  const size = fs.statSync(file).size;
+  if (!size) return;
+  const fd = fs.openSync(file, 'r');
+  const last = Buffer.alloc(1);
+  try {
+    fs.readSync(fd, last, 0, 1, size - 1);
+  } finally {
+    fs.closeSync(fd);
+  }
+  if (last[0] !== 0x0a) fs.appendFileSync(file, '\n');
 }
 
 /**
