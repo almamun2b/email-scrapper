@@ -90,6 +90,17 @@ test('beginScrape rotates a finished run\'s cache instead of deleting it (H3)', 
   assert.ok(fs.existsSync(files.marker));
 });
 
+test('--retry-failed reuses a finished run\'s cache instead of rotating it', () => {
+  const dir = tmp();
+  const files = cacheFiles(dir, 'x');
+  const line = JSON.stringify(site('https://a.nz/')) + '\n';
+  fs.writeFileSync(files.cache, line);
+  const r = beginScrape(files, true, true);
+  assert.deepEqual(r, { resumed: false, rotatedTo: undefined });
+  assert.equal(fs.readFileSync(files.cache, 'utf8'), line);
+  assert.deepEqual(fs.readdirSync(dir).sort(), ['x.inprogress', 'x.jsonl']);
+});
+
 test('an interrupted re-scrape resumes instead of resetting again (H3)', () => {
   const files = cacheFiles(tmp(), 'x');
   fs.writeFileSync(files.cache, 'old\n');
@@ -115,11 +126,15 @@ test('loadCache skips corrupt lines', () => {
   assert.equal(loadCache(files.cache).size, 1);
 });
 
-test('isRetryable: only failures with no emails, never robots blocks (M10)', () => {
+test('isRetryable: failures with no emails and rate-limited sites, never robots blocks (M10)', () => {
+  const emails = [{ email: 'a@b.nz', name: null, link: 'x' }];
   assert.equal(isRetryable(site('a', { error: 'unreachable' })), true);
   assert.equal(isRetryable(site('a', { error: 'robots-disallowed' })), false);
-  assert.equal(isRetryable(site('a', { error: 'timeout', emails: [{ email: 'a@b.nz', name: null, link: 'x' }] })), false);
+  assert.equal(isRetryable(site('a', { error: 'timeout', emails })), false);
   assert.equal(isRetryable(site('a')), false);
+  assert.equal(isRetryable(site('a', { emails, rateLimited: 3 })), true);
+  assert.equal(isRetryable(site('a', { emails })), false);
+  assert.equal(isRetryable(site('a', { error: 'robots-disallowed', rateLimited: 1 })), false);
 });
 
 test('writeCacheAtomic leaves no temp file', () => {

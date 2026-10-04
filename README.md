@@ -121,7 +121,7 @@ Rules:
 | `npm run scrape` | Scrape every `websites/*.csv` that has no output in `emails/` yet |
 | `npm run scrape -- websites/a.csv [b.csv …]` | Scrape specific files. This always re-scrapes, even if an output exists |
 | `npm run scrape -- --force` | Re-scrape all files in `websites/` from scratch |
-| `npm run scrape -- --retry-failed` | Re-scrape only sites that failed with no emails (unreachable, timeout, …). Sites with partial results and `robots-disallowed` sites are kept. Rebuilds the CSVs and logs |
+| `npm run scrape -- --retry-failed` | Re-scrape only sites that failed with no emails (unreachable, timeout, …) or had pages skipped by rate limiting. The existing cache is reused as is, and everything else is kept, including `robots-disallowed` sites. A retried site that comes back with fewer emails keeps its earlier result. Rebuilds the CSVs and logs |
 | `npm run scrape -- --summary-only` | Scrape nothing. Rebuild the CSVs and summary logs from the cache, applying the current email and name rules. Skips (and leaves untouched) a file with no cache or an interrupted scrape |
 | `npm run scrape -- --quick` | Lighter, faster crawl (150 pages, 10 min per site). See [Crawl options](#crawl-options-depth-and-limits) |
 | `npm run scrape -- --log-level=debug` | Also write every failed request, timeout and robots decision to `logs/`. See [Diagnostic logs](#diagnostic-logs) |
@@ -347,7 +347,7 @@ Failure reasons:
 
 "No emails found" means the site was crawled successfully but publishes no email address. Often it only has a contact form.
 
-A `Limited : N page(s) skipped on M site(s) …` line means those servers answered HTTP 429 (Too Many Requests) or 503 (Service Unavailable) even after one retry, so those pages were skipped. The busiest servers are listed. A few is normal. If it's large, re-scrape that file with fewer parallel requests (`--host-concurrency=2`, or `--concurrency=6`). `--retry-failed` only redoes sites that ended with no emails, so it won't fill in pages skipped on sites that did return some. The per-site progress line also shows `N pages rate-limited`.
+A `Limited : N page(s) skipped on M site(s) …` line means those servers answered HTTP 429 (Too Many Requests) or 503 (Service Unavailable) even after one retry, so those pages were skipped. The busiest servers are listed. A few is normal. The scraper already slows down for a server that answers 429/503 (see [Politeness and robots.txt](#politeness-and-robotstxt)), so `--retry-failed` is usually enough: it re-crawls every site with skipped pages and keeps the earlier result if the retry finds fewer emails. If the line stays large, re-scrape that file with fewer parallel requests (`--host-concurrency=2`, or `--concurrency=6`). The per-site progress line also shows `N pages rate-limited`.
 
 ## Diagnostic logs
 
@@ -404,7 +404,7 @@ Files in `emails/.cache/` for each input `<name>`:
 
 - **Interrupted runs resume automatically,** including interrupted `--force` and explicit-file re-scrapes. Run the same command again (or a plain `npm run scrape`) and cached sites are skipped.
 - **A fresh re-scrape keeps the old cache.** When a file with an existing output is scraped again (`--force` or an explicit file argument), its cache is renamed to `<name>.<timestamp>.jsonl` and a new one is started.
-- **Outputs always use the current rules.** The CSV and summary re-apply the current email checks and name rules to every cached row, so after an update `--summary-only` cleans old outputs without re-scraping. The cache files themselves are never rewritten (except by `--retry-failed`, which drops the failed sites it is about to redo, via an atomic rename).
+- **Outputs always use the current rules.** The CSV and summary re-apply the current email checks and name rules to every cached row, so after an update `--summary-only` cleans old outputs without re-scraping. The cache files themselves are never rewritten (except by `--retry-failed`, which drops the failed sites with no emails it is about to redo, via an atomic rename; earlier rows of rate-limited sites are kept until the retry's row supersedes them).
 
 ## How it works
 
@@ -459,6 +459,7 @@ Pages under that path are fetched first, sitemap seeds are limited to that path,
 - **`Crawl-delay` is honoured** (capped at 10 seconds), as a minimum gap between requests to that server.
 - At most **3 requests at a time to any one server** across all sites being crawled. This matters when many input domains redirect to the same server.
 - HTTP 429/503 responses and transient network errors are retried once, after the server's `Retry-After` (1–30 s) or 3 seconds. A page still refused is skipped and counted (see `Limited` in [Summary logs](#summary-logs)).
+- **A server that rate-limits is slowed down automatically.** Each 429/503 doubles the gap between requests to that server (1 s, 2 s, 4 s … up to 10 s), for every site hosted there, and each normal answer halves it again.
 - **Only public addresses are fetched.** Redirects (and, in the browser, any request) to localhost, private networks or cloud metadata addresses are refused.
 
 ## Tuning

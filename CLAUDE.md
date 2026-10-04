@@ -16,7 +16,7 @@ npx tsx scripts/recheck-cache.ts                 # what the current rules would 
 npm run scrape                                   # all websites/*.csv without an output yet
 npm run scrape -- websites/x.csv                 # specific file(s); always re-scrapes
 npm run scrape -- --force                        # re-scrape everything
-npm run scrape -- --retry-failed                 # re-crawl only failed sites, reuse cache for the rest
+npm run scrape -- --retry-failed                 # re-crawl only failed or rate-limited sites, reuse cache for the rest
 npm run scrape -- --summary-only                 # rebuild CSVs + logs from cache with current rules, no network
 npm run scrape -- --quick                        # lighter crawl (150 pages, 10 min/site); default is deep
 npm run scrape -- x.csv --log-level=debug        # also log every failed request to logs/scraper-<date>.log
@@ -41,7 +41,7 @@ Pipeline: `index.ts` (per-file orchestration; helpers in `cli.ts`, `input.ts`, `
 - **Concurrency layers:**
   - 12 sites in parallel (`index.ts`).
   - Per-site page workers.
-  - A global per-server `p-limit(3)` inside `httpGet` (per redirect hop), because many input domains can redirect to one server. 429/503 and transient network errors are retried once; DNS/refused/TLS errors are not.
+  - A global per-server `p-limit(3)` inside `httpGet` (per redirect hop), because many input domains can redirect to one server. 429/503 and transient network errors are retried once; DNS/refused/TLS errors are not. Each 429/503 also doubles that server's request gap (1–10 s), and normal answers halve it.
   - A global browser page limit of 4.
   - Each site has a soft budget (`--budget`, 20 min) that keeps partial results, plus a hard timeout of budget + 4 min in `index.ts` that aborts the site's `AbortSignal` and still keeps what it found.
 - **Naming precedence:** `name || pageTitle || business`. Person names are deliberately conservative. `consistentPerson()` keeps a scraped name only if it matches whole tokens of the email's local part (or it has a title like Dr). `nameFromLocal()` needs a first part from `src/data/given-names.txt` and no `DEPT_WORDS`. `demoteRolePrefixes()` clears per-branch role mailboxes (`bec.<city>@`). A wrong person name is considered worse than a business name.

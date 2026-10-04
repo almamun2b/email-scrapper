@@ -158,14 +158,21 @@ async function processFile(file: string, opts: RunOptions, retryFailed: boolean,
     }
 
     if (!summaryOnly) {
-      const { resumed, rotatedTo } = beginScrape(cf, fs.existsSync(outFile));
+      const { resumed, rotatedTo } = beginScrape(cf, fs.existsSync(outFile), retryFailed);
       if (resumed) log.info({ cacheFile: rel(cf.cache) }, `${base}: resuming an interrupted scrape from the cache`);
       if (rotatedTo) log.info({ previousCache: rel(rotatedTo) }, `${base}: previous cache kept as ${rel(rotatedTo)}`);
     }
     const done = loadCache(cf.cache);
+    // Results being retried that found emails: a retry that finds fewer (rate-limited again) keeps these.
+    const previous = new Map<string, SiteResult>();
     if (retryFailed) {
-      for (const [site, r] of done) if (isRetryable(r)) done.delete(site);
-      writeCacheAtomic(cf.cache, done.values());
+      for (const [site, r] of done) {
+        if (!isRetryable(r)) continue;
+        if (r.emails.length) previous.set(site, r);
+        done.delete(site);
+      }
+      // Earlier results stay in the file (a later line wins in loadCache), so an interrupted retry loses nothing.
+      writeCacheAtomic(cf.cache, [...previous.values(), ...done.values()]);
     }
     log.info({ input: rel(file), sites: sites.length, cached: done.size }, `\n=== ${base}: ${sites.length} sites (${done.size} cached) ===`);
 
@@ -177,7 +184,12 @@ async function processFile(file: string, opts: RunOptions, retryFailed: boolean,
           if (done.has(site) || summaryOnly) return;
           const t0 = Date.now();
           log.debug('site started');
-          const r = await runSite(site, opts);
+          let r = await runSite(site, opts);
+          const prev = previous.get(site);
+          if (prev && r.emails.length < prev.emails.length) {
+            log.info({ emails: r.emails.length, previousEmails: prev.emails.length }, `retry found ${r.emails.length} emails, fewer than the ${prev.emails.length} before; keeping the earlier result`);
+            r = prev;
+          }
           done.set(site, r);
           fs.appendFileSync(cf.cache, JSON.stringify(r) + '\n');
           n++;

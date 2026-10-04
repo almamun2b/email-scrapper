@@ -40,9 +40,13 @@ export function loadCache(file: string): Map<string, SiteResult> {
   return done;
 }
 
-/** A failure worth re-crawling: nothing found, and not a robots.txt block (that won't change). */
+/**
+ * Worth re-crawling: a failure with nothing found, or a site where the server rate-limited some pages
+ * away. Never a robots.txt block (that won't change).
+ */
 export function isRetryable(r: SiteResult): boolean {
-  return !!r.error && r.emails.length === 0 && r.error !== 'robots-disallowed';
+  if (r.error === 'robots-disallowed') return false;
+  return (!!r.error && r.emails.length === 0) || (r.rateLimited ?? 0) > 0;
 }
 
 /** Replaces the cache file via a temp file and rename, so a crash never leaves it truncated. */
@@ -58,12 +62,13 @@ function stamp(d = new Date()): string {
 
 /**
  * Called before scraping a file. Resumes when an earlier scrape of it was interrupted (marker present).
- * Otherwise a finished earlier run (output CSV exists) has its cache renamed aside, so it is kept but not reused.
+ * Otherwise a finished earlier run (output CSV exists) has its cache renamed aside, so it is kept but not
+ * reused, unless keepCache is set (--retry-failed builds on the existing cache).
  */
-export function beginScrape(files: CacheFiles, outputExists: boolean): { resumed: boolean; rotatedTo?: string } {
+export function beginScrape(files: CacheFiles, outputExists: boolean, keepCache = false): { resumed: boolean; rotatedTo?: string } {
   if (fs.existsSync(files.marker)) return { resumed: true };
   let rotatedTo: string | undefined;
-  if (outputExists && fs.existsSync(files.cache)) {
+  if (outputExists && !keepCache && fs.existsSync(files.cache)) {
     rotatedTo = files.cache.replace(/\.jsonl$/, `.${stamp()}.jsonl`);
     fs.renameSync(files.cache, rotatedTo);
   }

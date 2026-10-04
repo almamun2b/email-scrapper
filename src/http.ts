@@ -37,7 +37,10 @@ export interface GetOptions {
 let hostConcurrency = 3;
 const hostLimits = new Map<string, ReturnType<typeof pLimit>>();
 const crawlDelay = new Map<string, number>(); // ms between requests, from robots.txt
+const backoff = new Map<string, number>(); // extra ms between requests while a server answers 429/503
 const nextSlot = new Map<string, number>();
+const MIN_BACKOFF_MS = 1_000;
+const MAX_GAP_MS = 10_000;
 
 /** Set before the first request: limiters already created keep their size. */
 export function setHostConcurrency(n: number): void {
@@ -46,7 +49,31 @@ export function setHostConcurrency(n: number): void {
 
 /** Honours a robots.txt Crawl-delay for a server, capped so one site can't stall the run. */
 export function setCrawlDelay(hostname: string, seconds: number): void {
-  if (seconds > 0) crawlDelay.set(baseHost(hostname), Math.min(seconds, 10) * 1000);
+  if (seconds > 0) crawlDelay.set(baseHost(hostname), Math.min(seconds * 1000, MAX_GAP_MS));
+}
+
+/**
+ * Adapts to a server's rate limiting, shared by every site on it: each 429/503 doubles the gap
+ * between its requests (1 s up to 10 s), each normal answer halves it again.
+ */
+function pace(host: string, limited: boolean): void {
+  const cur = backoff.get(host) ?? 0;
+  if (limited) backoff.set(host, Math.min(MAX_GAP_MS, Math.max(MIN_BACKOFF_MS, cur * 2)));
+  else if (cur / 2 >= MIN_BACKOFF_MS) backoff.set(host, cur / 2);
+  else backoff.delete(host);
+}
+
+/** Current ms between requests to a server: the larger of its Crawl-delay and its rate-limit backoff. */
+export function hostGapMs(hostname: string): number {
+  const host = baseHost(hostname);
+  return Math.max(crawlDelay.get(host) ?? 0, backoff.get(host) ?? 0);
+}
+
+/** Forgets all per-server pacing (tests only: every local test server is 127.0.0.1). */
+export function resetHostPacing(): void {
+  crawlDelay.clear();
+  backoff.clear();
+  nextSlot.clear();
 }
 
 function hostLimit(host: string): ReturnType<typeof pLimit> {
@@ -55,9 +82,9 @@ function hostLimit(host: string): ReturnType<typeof pLimit> {
   return l;
 }
 
-/** Inside a host slot: waits until this server's crawl delay since the previous request has passed. */
+/** Inside a host slot: waits until this server's gap (Crawl-delay or backoff) since the previous request has passed. */
 async function waitTurn(host: string, signal?: AbortSignal): Promise<void> {
-  const gap = crawlDelay.get(host);
+  const gap = hostGapMs(host);
   if (!gap) return;
   const now = Date.now();
   const at = Math.max(now, nextSlot.get(host) ?? 0);
@@ -151,6 +178,7 @@ async function request(url: string, opts: GetOptions): Promise<HttpResult | null
         'accept-language': 'en-AU,en-NZ;q=0.9,en;q=0.8',
       },
     });
+    pace(baseHost(new URL(url).hostname), res.status === 429 || res.status === 503);
     const type = res.headers.get('content-type') ?? '';
     const result = (body = '', bytes = Buffer.alloc(0)): HttpResult => ({ status: res.status, url, type, body, bytes });
     // Always release an unread body: cheerio loads npm undici, which then backs global fetch, and

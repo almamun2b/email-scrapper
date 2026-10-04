@@ -5,6 +5,7 @@ import { gzipSync } from 'node:zlib';
 import { chromium } from 'playwright';
 import { page, startServer, type Route } from './helpers/server.js';
 import { closeBrowser, scrapeSite } from '../src/crawler.js';
+import { hostGapMs, httpGet, resetHostPacing, setCrawlDelay } from '../src/http.js';
 
 after(() => closeBrowser());
 
@@ -188,6 +189,30 @@ test('pages refused with 429 are counted, and the rest of the site is kept', asy
     assert.equal(r.rateLimited, 2);
     assert.deepEqual(emailsOf(r), ['info@acme.co.nz']);
   } finally {
+    resetHostPacing();
+    await s.close();
+  }
+});
+
+test('a server answering 429 is slowed down, then sped up again by normal answers', async () => {
+  const s = await startServer({
+    '/busy': { status: 429, headers: { 'retry-after': '1' }, body: '' },
+    '/ok': page('<p>fine</p>'),
+  });
+  try {
+    assert.equal(hostGapMs('127.0.0.1'), 0);
+    assert.equal((await httpGet(s.url + '/busy'))?.status, 429); // refused twice (with the one retry): 1 s, then 2 s
+    assert.equal(hostGapMs('127.0.0.1'), 2000);
+    setCrawlDelay('127.0.0.1', 5);
+    assert.equal(hostGapMs('127.0.0.1'), 5000, 'a larger robots Crawl-delay still wins');
+    resetHostPacing();
+    assert.equal((await httpGet(s.url + '/busy'))?.status, 429);
+    assert.equal((await httpGet(s.url + '/ok'))?.status, 200);
+    assert.equal(hostGapMs('127.0.0.1'), 1000);
+    assert.equal((await httpGet(s.url + '/ok'))?.status, 200);
+    assert.equal(hostGapMs('127.0.0.1'), 0);
+  } finally {
+    resetHostPacing();
     await s.close();
   }
 });
