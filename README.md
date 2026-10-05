@@ -3,9 +3,9 @@
 Crawls every website listed in a CSV file and extracts every email address it can find. Each input file produces an output CSV with one row per unique email, plus a summary log.
 
 ```
-websites/nz_dentists_all.csv   ──►   emails/nz_dentists_all.csv
-(list of websites)                   (name, email, website, link)
-                                     emails/logs/nz_dentists_all.log
+websites/healthcare/nz_dentists_all.csv   ──►   emails/healthcare/emails/nz_dentists_all.csv
+(list of websites, in a category folder)         (name, email, website, link)
+                                                 emails/healthcare/logs/nz_dentists_all.log
 ```
 
 Built with TypeScript on Node.js. It uses [cheerio](https://cheerio.js.org/) to parse HTML and [Playwright](https://playwright.dev/) (headless Chromium) as a fallback for JavaScript-rendered sites.
@@ -62,7 +62,7 @@ npm test
 
 ## Quick start
 
-1. Put a CSV of websites in `websites/`, for example `websites/nz_vets.csv`:
+1. Put a CSV of websites in a category folder under `websites/`, for example `websites/healthcare/nz_vets.csv` (see [Categories](#categories)):
 
    ```csv
    website
@@ -76,9 +76,24 @@ npm test
    npm run scrape
    ```
 
-3. Collect the results from `emails/nz_vets.csv`. The summary is in `emails/logs/nz_vets.log`.
+3. Collect the results from `emails/healthcare/emails/nz_vets.csv`. The summary is in `emails/healthcare/logs/nz_vets.log`.
 
-With no arguments, `npm run scrape` processes only files in `websites/` that don't have an output yet, so you can keep adding lists and re-running the same command.
+With no arguments, `npm run scrape` processes only files in `websites/` (and its category folders) that don't have an output yet, so you can keep adding lists and re-running the same command.
+
+## Categories
+
+A website list belongs to the category named by its folder, and everything it produces goes into one folder of the same name under `emails/`:
+
+```
+websites/dealers/au.ford.csv   ──►   emails/dealers/emails/au.ford.csv
+                                     emails/dealers/.cache/au.ford.jsonl
+                                     emails/dealers/logs/au.ford.log
+                                     emails/dealers/unique/dealers.csv     (from --unique)
+```
+
+- Current categories: `healthcare`, `martial-arts`, `dealers`. A new category is just a new folder: create `websites/<category>/` and put the CSVs in it. Only one level of folders counts.
+- A CSV placed directly in `websites/` (or given from outside it) has no category and gets its own folder named after the file: `websites/clinics.csv` writes to `emails/clinics/emails/clinics.csv`, `emails/clinics/.cache/`, and so on.
+- Two lists with the same file name in different categories are fine. Two inputs that would write the same output file are an error.
 
 ## Input format
 
@@ -91,7 +106,7 @@ With no arguments, `npm run scrape` processes only files in `websites/` that don
 
 ## Output format
 
-`emails/<input-file-name>.csv`:
+`emails/<category>/emails/<input-file-name>.csv` (for a list with no category, `emails/<input-file-name>/emails/<input-file-name>.csv`):
 
 | Column | Meaning |
 |---|---|
@@ -116,26 +131,26 @@ Rules:
 
 ### Unique emails across files
 
-Each file is unique on its own, but the same email often appears in several files when the input lists overlap (the three theme-park lists share most of their websites). `--unique` combines existing outputs into one list with every email once. It scrapes nothing and leaves the per-file CSVs alone:
+Each file is unique on its own, but the same email often appears in several files when the input lists overlap (the three theme-park lists share most of their websites). `--unique` combines existing outputs into one list with every email once. It scrapes nothing and leaves the per-file CSVs alone. The list stays inside the category's folder:
 
 ```bash
-npm run scrape -- --unique                     # all emails/*.csv  -> emails/unique/all.csv
-npm run scrape -- --unique websites/au.*.csv   # only those files  -> emails/unique/au.csv
+npm run scrape -- --unique                                # one list per category -> emails/<category>/unique/<category>.csv
+npm run scrape -- --unique websites/dealers/au.*.csv      # only those files      -> emails/dealers/unique/au.csv
 ```
 
-The file name is the prefix the input names share before their first `.`, `_` or `-` (`au.*` → `au`, `nz_*` → `nz`), or `all`. Columns are the same `name,email,website,link`. When an email is in several files, the row from the first file alphabetically is kept. A summary (files, rows read, duplicates removed, most-overlapping files) is appended to `emails/logs/unique.<prefix>.log`.
+With no arguments, each category folder in `emails/` gets its own combined list, so categories are never mixed. With files, the name is the prefix the input names share before their first `.`, `_` or `-` (`au.*` → `au`), or `all`. If the files you name belong to different categories, the combined list goes to `emails/unique/<name>.csv` instead, the only output outside a category folder. Columns are the same `name,email,website,link`. When an email is in several files, the row from the first file (sorted by category, then name) is kept. A summary (files, rows read, duplicates removed, most-overlapping files) is appended to `emails/<category>/logs/unique.<name>.log`.
 
 ## Command reference
 
 | Command | What it does |
 |---|---|
-| `npm run scrape` | Scrape every `websites/*.csv` that has no output in `emails/` yet |
-| `npm run scrape -- websites/a.csv [b.csv …]` | Scrape specific files. This always re-scrapes, even if an output exists |
+| `npm run scrape` | Scrape every list in `websites/` (and its category folders) that has no output in `emails/` yet |
+| `npm run scrape -- websites/dealers/a.csv [b.csv …]` | Scrape specific files. This always re-scrapes, even if an output exists |
 | `npm run scrape -- --force` | Re-scrape all files in `websites/` from scratch |
 | `npm run scrape -- --retry-failed` | Re-scrape only sites that failed with no emails (unreachable, timeout, …) or had pages skipped by rate limiting. The existing cache is reused as is, and everything else is kept, including `robots-disallowed` sites. A retried site that comes back with fewer emails keeps its earlier result. Rebuilds the CSVs and logs |
 | `npm run scrape -- --summary-only` | Scrape nothing. Rebuild the CSVs and summary logs from the cache, applying the current email and name rules. Skips (and leaves untouched) a file with no cache or an interrupted scrape |
-| `npm run scrape -- --unique` | Scrape nothing. Combine every `emails/*.csv` into `emails/unique/all.csv` with each email once. See [Unique emails across files](#unique-emails-across-files) |
-| `npm run scrape -- --unique websites/au.*.csv` | Same, for only the named files: writes `emails/unique/au.csv` |
+| `npm run scrape -- --unique` | Scrape nothing. Combine each category's outputs into `emails/<category>/unique/<category>.csv` with each email once. See [Unique emails across files](#unique-emails-across-files) |
+| `npm run scrape -- --unique websites/dealers/au.*.csv` | Same, for only the named files: writes `emails/dealers/unique/au.csv` |
 | `npm run scrape -- --quick` | Lighter, faster crawl (150 pages, 10 min per site). See [Crawl options](#crawl-options-depth-and-limits) |
 | `npm run scrape -- --log-level=debug` | Also write every failed request, timeout and robots decision to `logs/`. See [Diagnostic logs](#diagnostic-logs) |
 | `npm run typecheck` | Type-check the project with `tsc --noEmit` |
@@ -222,7 +237,7 @@ The most aggressive setting you might use is `--concurrency=24 --page-concurrenc
 - The per-server cap counts hostnames, not shared platforms. Hundreds of dealer sites run on the same platforms and CDNs, so those providers can still see a burst. Some rate-limit or block it, and blocked sites then look like "no emails found".
 - Heavily loaded sites hit the per-site budget (`--budget`, 20 minutes by default) sooner and return partial results, so you can get fewer emails.
 
-**Recommended approach:** start with a moderate setting and watch the first file's failure counts in `emails/logs/<name>.log`. Raise the numbers only if the failures stay low.
+**Recommended approach:** start with a moderate setting and watch the first file's failure counts in `emails/<category>/logs/<name>.log`. Raise the numbers only if the failures stay low.
 
 ```bash
 npm run scrape -- --concurrency=16 --page-concurrency=3 --host-concurrency=3
@@ -233,11 +248,11 @@ If failures are high, lower the numbers, or run `--retry-failed` afterwards.
 Examples:
 
 ```bash
-npm run scrape -- websites/au.toyota.csv
+npm run scrape -- websites/dealers/au.toyota.csv
 ```
 
 ```bash
-npm run scrape -- websites/nz_dentists_all.csv --quick
+npm run scrape -- websites/healthcare/nz_dentists_all.csv --quick
 ```
 
 ```bash
@@ -248,14 +263,14 @@ npm run scrape -- websites/big.csv --max-pages=800 --budget=40
 npm run scrape -- websites/huge.csv --max-depth=2 --concurrency=16
 ```
 
-The options used are also written into each summary in `emails/logs/<name>.log`, so you can see how every run was configured.
+The options used are also written into each summary in `emails/<category>/logs/<name>.log`, so you can see how every run was configured.
 
 ## Running long jobs
 
 Rough timings for 150 websites: about 30–60 minutes with `--quick`, and about 1–2 hours with the default deep crawl. Run long jobs in the background so they survive closing the terminal:
 
 ```bash
-mkdir -p logs && nohup npm run scrape -- websites/au.toyota.csv > logs/run.log 2>&1 &
+mkdir -p logs && nohup npm run scrape -- websites/dealers/au.toyota.csv > logs/run.log 2>&1 &
 ```
 
 ```bash
@@ -282,12 +297,12 @@ kill 23456
 
 The scraper logs `SIGTERM received, shutting down`, closes the headless browser and exits. Stopping only the `npm` PID leaves the scraper running in the background.
 
-**Resume** after a stop, crash or reboot: run the same command again, or a plain `npm run scrape`. Sites already in `emails/.cache/<name>.jsonl` are skipped. This also works for an interrupted re-scrape (`--force` or an explicit file). Two runs can't work on the same file at once: the second one skips it with an error (see [Cache and resuming](#cache-and-resuming)).
+**Resume** after a stop, crash or reboot: run the same command again, or a plain `npm run scrape`. Sites already in `emails/<category>/.cache/<name>.jsonl` are skipped. This also works for an interrupted re-scrape (`--force` or an explicit file). Two runs can't work on the same file at once: the second one skips it with an error (see [Cache and resuming](#cache-and-resuming)).
 
 After a run finishes:
-- `emails/<name>.csv` holds the results.
-- `emails/logs/<name>.log` holds the summary: websites with emails, failures by reason, unique emails, and name breakdown.
-- Emails are unique within each file. For one list without repeats across files, run `npm run scrape -- --unique websites/au.*.csv` (writes `emails/unique/au.csv`).
+- `emails/<category>/emails/<name>.csv` holds the results.
+- `emails/<category>/logs/<name>.log` holds the summary: websites with emails, failures by reason, unique emails, and name breakdown.
+- Emails are unique within each file. For one list without repeats across files, run `npm run scrape -- --unique websites/dealers/au.*.csv` (writes `emails/dealers/unique/au.csv`).
 - `logs/error-<date>.log` lists every error from the run with its stack trace. If it's empty, nothing went wrong internally. See [Diagnostic logs](#diagnostic-logs).
 - If many sites failed with `unreachable` or `timeout` (often network hiccups), run `npm run scrape -- websites/<name>.csv --retry-failed`.
 - If failures read `browserType.launch: Executable doesn't exist …`, Playwright's Chromium isn't installed, or doesn't match the installed Playwright version. Every site that needs the browser fallback then fails. Fix it with the command below, then rerun with `--retry-failed`:
@@ -298,7 +313,7 @@ After a run finishes:
 
 ## Running the Australian lists
 
-The `websites/au.*.csv` files list Australian car dealers by brand and businesses connected with the Gold Coast theme parks:
+The `websites/dealers/au.*.csv` files list Australian car dealers by brand and businesses connected with the Gold Coast theme parks:
 
 | File | Contents |
 |---|---|
@@ -308,38 +323,38 @@ The `websites/au.*.csv` files list Australian car dealers by brand and businesse
 Run all of them in the background with the default deep crawl. Each file is processed in turn and gets its own output and log:
 
 ```bash
-mkdir -p logs && nohup npm run scrape -- websites/au.*.csv > logs/au-run.log 2>&1 &
+mkdir -p logs && nohup npm run scrape -- websites/dealers/au.*.csv > logs/au-run.log 2>&1 &
 ```
 
 Or run one list at a time:
 
 ```bash
-npm run scrape -- websites/au.toyota.csv
+npm run scrape -- websites/dealers/au.toyota.csv
 ```
 
 Afterwards, retry the sites that failed. The `--retry-failed` run keeps everything else:
 
 ```bash
-npm run scrape -- websites/au.*.csv --retry-failed
+npm run scrape -- websites/dealers/au.*.csv --retry-failed
 ```
 
 Rebuild the CSVs and logs from the cache without touching the network:
 
 ```bash
-npm run scrape -- websites/au.*.csv --summary-only
+npm run scrape -- websites/dealers/au.*.csv --summary-only
 ```
 
-Combine all AU outputs into one list with each email once (`emails/unique/au.csv`), see [Unique emails across files](#unique-emails-across-files):
+Combine all AU outputs into one list with each email once (`emails/dealers/unique/au.csv`), see [Unique emails across files](#unique-emails-across-files):
 
 ```bash
-npm run scrape -- --unique websites/au.*.csv
+npm run scrape -- --unique websites/dealers/au.*.csv
 ```
 
-Note that `npm run scrape -- websites/au.*.csv` always re-scrapes the files named. A plain `npm run scrape` would also pick up any `websites/*.csv` that has no output yet. Dealer sites are big, so expect roughly 1–2 hours per 150 sites with the default deep crawl. For a faster first pass, add `--quick`.
+Note that `npm run scrape -- websites/dealers/au.*.csv` always re-scrapes the files named. A plain `npm run scrape` would also pick up any list in `websites/` that has no output yet. Dealer sites are big, so expect roughly 1–2 hours per 150 sites with the default deep crawl. For a faster first pass, add `--quick`.
 
 ## Summary logs
 
-After each CSV is processed, a summary is printed and **appended** to `emails/logs/<name>.log`. The file keeps a history of every run.
+After each CSV is processed, a summary is printed and **appended** to `emails/<category>/logs/<name>.log`. The file keeps a history of every run.
 
 ```
 [2026-09-29 13:49:30] nz_veterinarians_all.csv  (scrape, took 38m 12s)
@@ -411,9 +426,9 @@ jq -c 'select(.site == "https://example.co.nz/")' logs/scraper-2026-10-03.log
 
 ## Cache and resuming
 
-Each finished site is appended as one JSON line to `emails/.cache/<name>.jsonl`. The line holds the site URL, final URL after redirects, business name, emails with names, page titles, links and where each email was found (`source`), pages fetched, whether the browser was used, and any error.
+Each finished site is appended as one JSON line to `emails/<category>/.cache/<name>.jsonl`. The line holds the site URL, final URL after redirects, business name, emails with names, page titles, links and where each email was found (`source`), pages fetched, whether the browser was used, and any error.
 
-Files in `emails/.cache/` for each input `<name>`:
+Files in `emails/<category>/.cache/` for each input `<name>`:
 
 | File | Meaning |
 |---|---|
@@ -541,8 +556,8 @@ src/
   data/         given-names.txt
 test/           node:test suites and a local test server (npm test)
 scripts/        recheck-cache.ts, given-names-report.ts
-websites/       Input CSVs (git-ignored)
-emails/         Output CSVs, logs/ and .cache/ (git-ignored)
+websites/       Input CSVs, in category folders: websites/<category>/*.csv (git-ignored)
+emails/         One folder per category, each with emails/ (the output CSVs), logs/, .cache/ and unique/ (git-ignored)
 logs/           Diagnostic JSON logs: scraper-<date>.log, error-<date>.log (git-ignored)
 ```
 

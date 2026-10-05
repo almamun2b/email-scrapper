@@ -9,13 +9,16 @@ import fs from 'node:fs';
 import path from 'node:path';
 
 const ROOT = path.resolve(import.meta.dirname, '..');
-const CACHE_DIR = path.join(ROOT, 'emails', '.cache');
+const OUT_DIR = path.join(ROOT, 'emails');
 const min = Number(process.argv[2] ?? 1);
 const known = new Set(fs.readFileSync(path.join(ROOT, 'src', 'data', 'given-names.txt'), 'utf8').split('\n').filter(Boolean));
 
 const unknown = new Map<string, Set<string>>();
-for (const f of fs.readdirSync(CACHE_DIR).filter((f) => f.endsWith('.jsonl'))) {
-  for (const line of fs.readFileSync(path.join(CACHE_DIR, f), 'utf8').split('\n')) {
+const caches = fs.readdirSync(OUT_DIR, { withFileTypes: true })
+  .filter((d) => d.isDirectory() && fs.existsSync(path.join(OUT_DIR, d.name, '.cache')))
+  .flatMap((d) => fs.readdirSync(path.join(OUT_DIR, d.name, '.cache')).filter((f) => f.endsWith('.jsonl')).map((f) => path.join(OUT_DIR, d.name, '.cache', f)));
+for (const file of caches) {
+  for (const line of fs.readFileSync(file, 'utf8').split('\n')) {
     if (!line.trim()) continue;
     let r: { emails: { email: string }[] };
     try { r = JSON.parse(line); } catch { continue; }

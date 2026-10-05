@@ -3,7 +3,7 @@
  * Use it after editing extract.ts to review the effect on every real row scraped so far.
  *
  *   npx tsx scripts/recheck-cache.ts            # all caches
- *   npx tsx scripts/recheck-cache.ts au.ford    # one file
+ *   npx tsx scripts/recheck-cache.ts au.ford    # one file (or dealers/au.ford)
  *   npx tsx scripts/recheck-cache.ts --all      # print every change, not a sample
  */
 import fs from 'node:fs';
@@ -11,15 +11,19 @@ import path from 'node:path';
 import type { SiteResult } from '../src/crawler.js';
 import { recheckSite } from '../src/output.js';
 
-const CACHE_DIR = path.resolve(import.meta.dirname, '..', 'emails', '.cache');
+const OUT_DIR = path.resolve(import.meta.dirname, '..', 'emails');
 const args = process.argv.slice(2);
 const showAll = args.includes('--all');
 const only = args.filter((a) => !a.startsWith('--'));
 const SAMPLE = 25;
 
-const files = fs.readdirSync(CACHE_DIR)
-  .filter((f) => /^[^.]+(\.[^.]+)*\.jsonl$/.test(f) && !/\.\d{8}-\d{6}\.jsonl$/.test(f)) // skip rotated caches
-  .filter((f) => !only.length || only.includes(f.replace(/\.jsonl$/, '')));
+// emails/<group>/.cache/<base>.jsonl; `id` is <group>/<base>
+const files = fs.readdirSync(OUT_DIR, { withFileTypes: true })
+  .filter((d) => d.isDirectory() && fs.existsSync(path.join(OUT_DIR, d.name, '.cache')))
+  .flatMap((d) => fs.readdirSync(path.join(OUT_DIR, d.name, '.cache'))
+    .filter((f) => /^[^.]+(\.[^.]+)*\.jsonl$/.test(f) && !/\.\d{8}-\d{6}\.jsonl$/.test(f)) // skip rotated caches
+    .map((f) => ({ id: `${d.name}/${f.replace(/\.jsonl$/, '')}`, file: path.join(OUT_DIR, d.name, '.cache', f) })))
+  .filter((c) => !only.length || only.includes(c.id) || only.includes(c.id.split('/')[1]));
 
 let rows = 0;
 const dropped: string[] = [];
@@ -28,8 +32,8 @@ const nameLost: string[] = [];
 const nameChanged: string[] = [];
 const nameGained: string[] = [];
 
-for (const f of files) {
-  for (const line of fs.readFileSync(path.join(CACHE_DIR, f), 'utf8').split('\n')) {
+for (const { file } of files) {
+  for (const line of fs.readFileSync(file, 'utf8').split('\n')) {
     if (!line.trim()) continue;
     let r: SiteResult;
     try { r = JSON.parse(line); } catch { continue; }

@@ -5,21 +5,22 @@ This document explains how the email scraper is put together: the data flow, the
 ## Overview
 
 ```
-websites/<name>.csv
+websites/<category>/<name>.csv
+        │  paths.ts findInputs()/groupOf()/fileLayout(): category → emails/<group>/
         │  input.ts readSites(): find the website column, normalise, dedupe by host+path+query
         ▼
 ┌──────────────────────── src/index.ts ────────────────────────┐
 │  for each input file (sequential)                             │
-│    acquireLock(.cache/<name>.lock)                            │
+│    acquireLock(emails/<group>/.cache/<name>.lock)             │
 │    beginScrape(): resume (.inprogress) or rotate old cache    │
-│    load emails/.cache/<name>.jsonl  (resume / reuse)          │
+│    load emails/<group>/.cache/<name>.jsonl  (resume / reuse)  │
 │    p-limit(--concurrency=12) over uncached sites:             │
 │        runSite(): scrapeSite(site, opts, signal)              │
 │                   abort at budget + 4 min, 30 s grace         │
-│        append SiteResult → .cache/<name>.jsonl                │
+│        append SiteResult → <group>/.cache/<name>.jsonl        │
 │    recheckSite() every result with the current rules          │
 │    build CSV (input order, unique by email, formula-safe)     │
-│    writeSummary() → log + emails/logs/<name>.log              │
+│    writeSummary() → log + emails/<group>/logs/<name>.log      │
 │    endScrape(): remove .inprogress                            │
 └───────────────────────────────────────────────────────────────┘
         │ scrapeSite(site)
@@ -79,11 +80,12 @@ interface FoundOnPage {
 
 ### `src/index.ts`: orchestration
 
-- **Target selection:** with no file arguments, it uses all `websites/*.csv` whose output doesn't exist, plus any whose scrape was interrupted (`.inprogress` marker). `--force`, `--retry-failed` and `--summary-only` lift that skip. Explicit file arguments are always processed. Two targets with the same basename are an error, since they would share one output.
+- **Layout (`src/paths.ts`):** every input maps to a group folder `emails/<group>/` that holds its output CSVs in `emails/<group>/emails/`, plus `.cache/`, `logs/` and `unique/`. The group is the input's category folder (`websites/<category>/x.csv`, one level deep), else the file's own base name, so a list with no category gets a folder to itself. `fileLayout()` builds all the paths and `findInputs()` lists `websites/*.csv` plus `websites/*/*.csv`. `--unique` with no files writes one list per group folder, inside it; across groups it falls back to `emails/unique/`.
+- **Target selection:** with no file arguments, it uses every input found by `findInputs()` whose output doesn't exist, plus any whose scrape was interrupted (`.inprogress` marker). `--force`, `--retry-failed` and `--summary-only` lift that skip. Explicit file arguments are always processed. Two targets that would write the same output file are an error.
 - **Startup order:** `--log-level` is read first and file logging starts before the rest of the command line is validated, so a bad flag still lands in `logs/error-<date>.log`.
 - **Concurrency:** `--concurrency` sites at once (12). `runSite()` gives each site a hard limit of `budget + 4 min` (24 min by default). At the limit it aborts the site's `AbortSignal`; `scrapeSite` then stops its workers, sitemap loading and in-flight requests and returns what it found with `error: 'timeout'`. Only if it doesn't return within `STOP_GRACE_MS` (30 s) does the site get an empty `timeout` result. If `scrapeSite` rejects, the error is logged with its stack and the site gets `error: 'internal-error'`, so the rest of the run continues.
 - **CSV and summary:** every `SiteResult` (fresh or cached) goes through `recheckSite()` first, so outputs always follow the current email and name rules. Then `buildRows()` and `writeSummary()` run as below. The cache file is not rewritten.
-- **Summary:** `writeSummary()` prints the summary and appends it to `emails/logs/<name>.log`. It counts sites with emails, sites with no emails, failed sites grouped by reason, partial results, sites missing from the cache, the name-source breakdown, and top sites.
+- **Summary:** `writeSummary()` prints the summary and appends it to `emails/<group>/logs/<name>.log`. It counts sites with emails, sites with no emails, failed sites grouped by reason, partial results, sites missing from the cache, the name-source breakdown, and top sites.
 
 ### `src/cli.ts`: command line
 
@@ -95,7 +97,7 @@ interface FoundOnPage {
 
 ### `src/cache.ts`: cache lifecycle
 
-Per input file, in `emails/.cache/`:
+Per input file, in `emails/<group>/.cache/` (the group's cache dir is passed to `cacheFiles()`):
 - `<name>.jsonl`: the only file the loaders read. Sites are appended as they finish.
 - `<name>.inprogress`: written by `beginScrape()`, removed by `endScrape()` after the CSV and summary are written. If it exists at the start of a scrape, the scrape resumes from the cache instead of resetting. That's what makes an interrupted `--force` or explicit-file re-scrape resumable.
 - `<name>.<YYYYMMDD-HHMMSS>.jsonl`: when a file with an existing output is scraped again (and isn't resuming), `beginScrape()` renames the old cache to this name instead of deleting it. The owner keeps every cache for later analysis.
@@ -174,7 +176,7 @@ One shared browser runs across the whole process, with a new context per site (`
   - Node `warning`s are logged as `warn`.
   - SIGINT and SIGTERM close the browser and exit with 130/143.
 - **What is logged where:** run, file and site lifecycle at info. Failed sites, exhausted rate-limit retries, hard timeouts, skipped input rows and locked files at warn or error. Browser launch failures and site crashes at error. Every individual request failure (status, network error code, timeout), refused private address and skipped off-site redirect at debug.
-- **Separate from the summaries:** `emails/logs/<name>.log` (the human summary per input file) is separate and unchanged.
+- **Separate from the summaries:** `emails/<group>/logs/<name>.log` (the human summary per input file) is separate and unchanged.
 
 ### `src/extract.ts`: emails and names
 

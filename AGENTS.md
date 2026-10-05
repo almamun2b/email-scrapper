@@ -4,18 +4,18 @@ Operating guide for AI coding agents (Claude Code, Codex, Cursor, …) working i
 
 ## The recurring job
 
-The owner regularly drops a CSV of websites into `websites/` and asks the agent to "extract emails" from it. The agent runs the scraper and reports results. Output goes to `emails/<same-file-name>.csv` with columns **`name,email,website,link`**, and a summary is appended to `emails/logs/<same-file-name>.log`.
+The owner regularly drops a CSV of websites into `websites/<category>/` (`healthcare`, `martial-arts`, `dealers`, or a new folder for a new kind of list) and asks the agent to "extract emails" from it. The agent runs the scraper and reports results. Output goes to `emails/<category>/emails/<same-file-name>.csv` with columns **`name,email,website,link`**, and a summary is appended to `emails/<category>/logs/<same-file-name>.log`. Each category folder under `emails/` holds the output CSVs in its `emails/` subfolder, plus that category's `.cache/`, `logs/` and `unique/`. A CSV placed directly in `websites/` has no category and gets its own folder, `emails/<file-name>/`; if the owner hasn't said which category a new list belongs to, ask, or put it in a new category folder named after what it is.
 
 Standard procedure:
 
-1. Check the input: `head -5 websites/<file>.csv` and `wc -l websites/<file>.csv`. Any header named `website`/`url`/`domain`/`site`/`websites`/`link` works; otherwise the first column is used.
+1. Check the input: `head -5 websites/<category>/<file>.csv` and `wc -l websites/<category>/<file>.csv`. Any header named `website`/`url`/`domain`/`site`/`websites`/`link` works; otherwise the first column is used.
 2. Run it in the background, because it takes about 1–2 hours per 150 sites with the default deep crawl (30–60 minutes with `--quick`):
    ```bash
-   nohup npm run scrape -- websites/<file>.csv > <scratch>/run.log 2>&1 &
+   nohup npm run scrape -- websites/<category>/<file>.csv > <scratch>/run.log 2>&1 &
    ```
    Plain `npm run scrape` processes every input file that has no output yet.
 3. Watch progress in the log. Each site prints `[n/N] host — X emails, Y pages …`. The run for a file ends with a `=>` line and the summary block.
-4. If the run says a file is "in use by another run", another scrape holds `emails/.cache/<file>.lock`. Don't delete the lock; find and wait for that PID.
+4. If the run says a file is "in use by another run", another scrape holds `emails/<category>/.cache/<file>.lock`. Don't delete the lock; find and wait for that PID.
 5. Report per-file totals from the summary: websites with emails, websites with no emails, failed websites grouped by reason (`browser-error` means Chromium crashed on that site), unique emails, and name breakdown. A large `Limited` line means servers were rate-limiting: offer `--retry-failed`, which redoes sites with rate-limited pages too (with automatic per-server slow-down) and keeps the earlier result if it finds fewer emails. If it stays large, re-scrape the file with `--host-concurrency=2` or `--concurrency=6`. Mention noteworthy failures. Check `logs/error-<date>.log` (JSON lines, `npx pino-pretty < file` to read) and report any errors from the run (match its `runId`). For a site that failed for unclear reasons, re-run it alone with `--log-level=debug`.
 6. If many sites fail with transient errors, offer `npm run scrape -- --retry-failed`. It re-crawls only sites that failed with no emails or had rate-limited pages, reusing the existing cache, and keeps everything else.
 
@@ -28,13 +28,13 @@ Standard procedure:
 | Tests (no network needed) | `npm test` |
 | See what the current rules would change in existing outputs (writes nothing) | `npx tsx scripts/recheck-cache.ts` |
 | Scrape new input files | `npm run scrape` |
-| Scrape specific files (always re-scrapes) | `npm run scrape -- websites/a.csv` |
+| Scrape specific files (always re-scrapes) | `npm run scrape -- websites/dealers/a.csv` |
 | Re-scrape everything | `npm run scrape -- --force` |
 | Re-scrape only failed sites | `npm run scrape -- --retry-failed` |
 | Rebuild CSVs and logs from cache with the current rules, no network | `npm run scrape -- --summary-only` |
-| One list with each email once across all outputs, no network (`emails/unique/all.csv`) | `npm run scrape -- --unique` |
-| Same for only some files (`emails/unique/au.csv`) | `npm run scrape -- --unique websites/au.*.csv` |
-| Verbose diagnostics in `logs/` | `npm run scrape -- websites/a.csv --log-level=debug` |
+| One list per category with each email once, no network (`emails/<category>/unique/<category>.csv`) | `npm run scrape -- --unique` |
+| Same for only some files (`emails/dealers/unique/au.csv`) | `npm run scrape -- --unique websites/dealers/au.*.csv` |
+| Verbose diagnostics in `logs/` | `npm run scrape -- websites/dealers/a.csv --log-level=debug` |
 | Lighter, faster crawl (150 pages, 10 min/site) | `npm run scrape -- --quick` |
 | Tune limits (any combination) | `--max-pages=N --browser-pages=N --max-depth=N --budget=MIN --concurrency=N --page-concurrency=N --host-concurrency=N` |
 
@@ -56,15 +56,15 @@ Regression baseline: `https://lumino.co.nz/` gives 6 emails with the deep defaul
 
 After changing anything in `extract.ts`, run `npx tsx scripts/recheck-cache.ts` and review the dropped emails and removed or changed names against the 13k cached rows. Look for lost real people as well as junk that got through.
 
-For an end-to-end check, write a 2–4 row sample CSV outside `websites/` and run `npm run scrape -- <path>`. Then **delete** the generated `emails/<sample>.csv`, `emails/logs/<sample>.log` and `emails/.cache/<sample>.*` (the `.jsonl`, plus any `.inprogress`, `.lock` or rotated `<sample>.<timestamp>.jsonl`). This is the only cache cleanup allowed.
+For an end-to-end check, write a 2–4 row sample CSV outside `websites/` and run `npm run scrape -- <path>`. A sample outside `websites/` gets its own `emails/<sample>/` folder. Then **delete** that whole folder (output, logs, `.cache/` with its `.jsonl`, plus any `.inprogress`, `.lock` or rotated `<sample>.<timestamp>.jsonl`, and `unique/`). This is the only cache cleanup allowed.
 
 ## Rules the owner has set
 
 - **Output columns are exactly `name,email,website,link`.** `website` is the input URL and `link` is the page the email was found on. `name` falls back in this order: person name, then department page title, then business name.
-- **Never delete `emails/.cache/`.** The owner keeps it for future improvements. A fresh re-scrape renames the old cache to `<name>.<timestamp>.jsonl`; nothing deletes it.
+- **Never delete any `emails/<category>/.cache/`.** The owner keeps it for future improvements. A fresh re-scrape renames the old cache to `<name>.<timestamp>.jsonl`; nothing deletes it.
 - **Don't re-scrape existing outputs unless asked.** Code changes apply to future runs; the owner decides when to re-run. That includes `--summary-only`: it rebuilds existing CSVs with the current rules, so only run it when asked.
 - **Respect robots.txt**, including on the host reached after a redirect and in the browser fallback. Don't add bypasses.
-- **Each summary is appended** to `emails/logs/<name>.log` after every run. Keep that behaviour for any new mode.
+- **Each summary is appended** to `emails/<category>/logs/<name>.log` after every run. Keep that behaviour for any new mode.
 - `websites/`, `emails/` and `logs` are git-ignored data. Never commit them.
 
 ## Process hygiene

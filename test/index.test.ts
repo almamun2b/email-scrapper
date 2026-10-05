@@ -8,6 +8,7 @@ import { parseArgs, rawFlag } from '../src/cli.js';
 import type { SiteResult } from '../src/crawler.js';
 import { readSites } from '../src/input.js';
 import { buildRows, safeCell, uniqueLabel, uniqueRows } from '../src/output.js';
+import { categoryOf, fileLayout, findInputs, findOutputs, groupOf } from '../src/paths.js';
 
 const tmp = () => fs.mkdtempSync(path.join(os.tmpdir(), 'scraper-test-'));
 const site = (s: string, extra: Partial<SiteResult> = {}): SiteResult => ({
@@ -224,4 +225,36 @@ test('uniqueLabel names the combined file after the shared prefix', () => {
   assert.equal(uniqueLabel(['nz_dentists_all', 'nz_hospitals_all']), 'nz');
   assert.equal(uniqueLabel(['au.ford', 'nz_dentists_all']), 'all');
   assert.equal(uniqueLabel(['clinics']), 'clinics');
+});
+
+// ---------- category folders ----------
+
+const IN = path.join(path.sep, 'p', 'websites');
+const OUT = path.join(path.sep, 'p', 'emails');
+
+test('groupOf: category folder, else the file name; outputs map back to the same group', () => {
+  assert.equal(groupOf(path.join(IN, 'dealers', 'au.ford.csv'), IN, OUT), 'dealers');
+  assert.equal(groupOf(path.join(IN, 'clinics.csv'), IN, OUT), 'clinics');
+  assert.equal(groupOf(path.join(path.sep, 'elsewhere', 'sample.csv'), IN, OUT), 'sample');
+  assert.equal(groupOf(path.join(OUT, 'dealers', 'emails', 'au.ford.csv'), IN, OUT), 'dealers');
+  assert.equal(groupOf(path.join(IN, 'a', 'b', 'x.csv'), IN, OUT), 'x'); // only one level of category
+  assert.equal(categoryOf(path.join(IN, 'clinics.csv'), IN, OUT), undefined);
+});
+
+test('fileLayout puts output, cache, logs and unique inside the group folder', () => {
+  const l = fileLayout('dealers', 'au.ford', OUT);
+  assert.equal(l.id, 'dealers/au.ford');
+  assert.equal(l.outFile, path.join(OUT, 'dealers', 'emails', 'au.ford.csv'));
+  assert.equal(l.cacheDir, path.join(OUT, 'dealers', '.cache'));
+  assert.equal(l.logDir, path.join(OUT, 'dealers', 'logs'));
+  assert.equal(l.uniqueDir, path.join(OUT, 'dealers', 'unique'));
+});
+
+test('findInputs and findOutputs walk one level of category folders', () => {
+  const d = tmp();
+  const put = (...p: string[]) => { fs.mkdirSync(path.dirname(path.join(d, ...p)), { recursive: true }); fs.writeFileSync(path.join(d, ...p), 'x'); };
+  put('top.csv'); put('dealers', 'a.csv'); put('dealers', 'notes.txt'); put('dealers', 'deep', 'z.csv'); put('.hidden', 'h.csv');
+  assert.deepEqual(findInputs(d).map((f) => path.relative(d, f)), [path.join('dealers', 'a.csv'), 'top.csv']);
+  put('dealers', 'emails', 'a.csv'); put('dealers', 'top-level-ignored.csv'); put('unique', 'u.csv'); put('logs', 'l.csv'); put('.cache', 'c.csv');
+  assert.deepEqual([...findOutputs(d)].map(([g, f]) => [g, f.map((x) => path.basename(x))]), [['dealers', ['a.csv']]]);
 });

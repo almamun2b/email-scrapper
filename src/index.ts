@@ -10,13 +10,9 @@ import { CACHE_VERSION, closeBrowser, DEFAULT_OPTIONS, QUICK_OPTIONS, scrapeSite
 import { readSites } from './input.js';
 import { initFileLogging, installProcessHandlers, log, LOG_DIR, parseLevel, runId, withLogContext } from './logger.js';
 import { buildRows, recheckSite, uniqueLabel, uniqueRows, type Row } from './output.js';
+import { categoryOf, fileLayout, findInputs, findOutputs, groupOf, IN_DIR, OUT_DIR, ROOT, type FileLayout } from './paths.js';
 import { baseHost } from './urls.js';
 
-const ROOT = path.resolve(import.meta.dirname, '..');
-const IN_DIR = path.join(ROOT, 'websites');
-const OUT_DIR = path.join(ROOT, 'emails');
-const CACHE_DIR = path.join(OUT_DIR, '.cache');
-const SUMMARY_DIR = path.join(OUT_DIR, 'logs'); // per-file run summaries; diagnostics go to <root>/logs
 const HARD_TIMEOUT_EXTRA_MS = 4 * 60_000; // hard safety net on top of scrapeSite's soft budget, which keeps partial results
 const STOP_GRACE_MS = 30_000;
 
@@ -74,12 +70,12 @@ function reasonCode(error: string): string {
   return REASON_CODES.has(error) ? error : 'other';
 }
 
-/** Human-readable summary of one processed CSV; printed and appended to emails/logs/<name>.log. */
+/** Human-readable summary of one processed CSV; printed and appended to emails/<group>/logs/<name>.log. */
 function describe(o: RunOptions): string {
   return `${o.maxPages} pages, ${o.browserPages} browser pages, depth ${o.maxDepth || 'unlimited'}, ${o.budgetMs / 60_000} min/site, ${o.concurrency} sites in parallel, ${o.pageConcurrency} page requests per site, ${o.hostConcurrency} per server`;
 }
 
-function writeSummary(base: string, sites: string[], done: Map<string, SiteResult>, uniqueEmails: number, mode: string, startedAt: number): void {
+function writeSummary(layout: FileLayout, sites: string[], done: Map<string, SiteResult>, uniqueEmails: number, mode: string, startedAt: number): void {
   const results = sites.map((s) => done.get(s)).filter((r): r is SiteResult => !!r);
   const withEmails = results.filter((r) => r.emails.length > 0);
   const noEmails = results.filter((r) => !r.emails.length && !r.error);
@@ -104,7 +100,7 @@ function writeSummary(base: string, sites: string[], done: Map<string, SiteResul
   const stamp = new Date().toISOString().replace('T', ' ').slice(0, 19);
   const missing = sites.length - results.length;
   const lines = [
-    `[${stamp}] ${base}.csv  (${mode}, took ${fmtDuration(Date.now() - startedAt)})`,
+    `[${stamp}] ${layout.id}.csv  (${mode}, took ${fmtDuration(Date.now() - startedAt)})`,
     `  Websites : ${sites.length} total | ${withEmails.length} with emails | ${noEmails.length} no emails found | ${failed.length} failed`,
     `  Emails   : ${uniqueEmails} unique (${persons} person name, ${departments} department page title, ${uniqueEmails - persons - departments} business name)`,
     `  Crawl    : ${results.reduce((n, r) => n + r.pages, 0)} pages fetched | headless browser used on ${results.filter((r) => r.usedBrowser).length} sites`,
@@ -122,26 +118,25 @@ function writeSummary(base: string, sites: string[], done: Map<string, SiteResul
   if (failed.length) lines.push(`  Failed sites:\n${failed.map((r) => `    - ${host(r)} [${r.error}]`).join('\n')}`);
   if (noEmails.length) lines.push(`  No emails found on:\n${noEmails.map((r) => `    - ${host(r)}`).join('\n')}`);
   const text = lines.join('\n') + '\n';
-  fs.mkdirSync(SUMMARY_DIR, { recursive: true });
-  fs.appendFileSync(path.join(SUMMARY_DIR, `${base}.log`), text + '\n');
+  fs.mkdirSync(layout.logDir, { recursive: true });
+  fs.appendFileSync(path.join(layout.logDir, `${layout.base}.log`), text + '\n');
   log.info({ sites: sites.length, withEmails: withEmails.length, noEmails: noEmails.length, failed: failed.length, uniqueEmails, failures: Object.fromEntries(reasons) }, '\n' + text);
 }
 
-async function processFile(file: string, opts: RunOptions, retryFailed: boolean, summaryOnly = false): Promise<void> {
+async function processFile(file: string, layout: FileLayout, opts: RunOptions, retryFailed: boolean, summaryOnly = false): Promise<void> {
   const startedAt = Date.now();
-  const base = path.basename(file, path.extname(file));
-  const outFile = path.join(OUT_DIR, `${base}.csv`);
-  fs.mkdirSync(CACHE_DIR, { recursive: true });
-  const cf = cacheFiles(CACHE_DIR, base);
+  const { base, outFile } = layout;
+  fs.mkdirSync(layout.cacheDir, { recursive: true });
+  const cf = cacheFiles(layout.cacheDir, base);
   const rel = (f: string) => path.relative(ROOT, f);
 
   if (summaryOnly) {
     if (fs.existsSync(cf.marker)) {
-      log.warn({ input: rel(file) }, `Skipping ${base}: its last scrape was interrupted. Resume it first (re-run the scrape), then rebuild`);
+      log.warn({ input: rel(file) }, `Skipping ${layout.id}: its last scrape was interrupted. Resume it first (re-run the scrape), then rebuild`);
       return;
     }
     if (!fs.existsSync(cf.cache) || !fs.statSync(cf.cache).size) {
-      log.warn({ input: rel(file), cacheFile: rel(cf.cache) }, `Skipping ${base}: no cache to rebuild from, so ${rel(outFile)} is left untouched`);
+      log.warn({ input: rel(file), cacheFile: rel(cf.cache) }, `Skipping ${layout.id}: no cache to rebuild from, so ${rel(outFile)} is left untouched`);
       return;
     }
   }
@@ -151,17 +146,17 @@ async function processFile(file: string, opts: RunOptions, retryFailed: boolean,
     const input = readSites(file);
     const { sites } = input;
     if (input.invalid || input.duplicates) {
-      log.warn({ input: rel(file), invalid: input.invalid, duplicates: input.duplicates, column: input.column }, `${base}: skipped ${input.invalid} invalid and ${input.duplicates} duplicate website row(s)`);
+      log.warn({ input: rel(file), invalid: input.invalid, duplicates: input.duplicates, column: input.column }, `${layout.id}: skipped ${input.invalid} invalid and ${input.duplicates} duplicate website row(s)`);
     }
     if (!sites.length) {
-      log.warn({ input: rel(file), column: input.column }, `${base}: no websites found in the input (looked in column ${input.column + 1})`);
+      log.warn({ input: rel(file), column: input.column }, `${layout.id}: no websites found in the input (looked in column ${input.column + 1})`);
       return;
     }
 
     if (!summaryOnly) {
       const { resumed, rotatedTo } = beginScrape(cf, fs.existsSync(outFile), retryFailed);
-      if (resumed) log.info({ cacheFile: rel(cf.cache) }, `${base}: resuming an interrupted scrape from the cache`);
-      if (rotatedTo) log.info({ previousCache: rel(rotatedTo) }, `${base}: previous cache kept as ${rel(rotatedTo)}`);
+      if (resumed) log.info({ cacheFile: rel(cf.cache) }, `${layout.id}: resuming an interrupted scrape from the cache`);
+      if (rotatedTo) log.info({ previousCache: rel(rotatedTo) }, `${layout.id}: previous cache kept as ${rel(rotatedTo)}`);
       ensureTrailingNewline(cf.cache);
     }
     const done = loadCache(cf.cache);
@@ -176,7 +171,7 @@ async function processFile(file: string, opts: RunOptions, retryFailed: boolean,
       // Earlier results stay in the file (a later line wins in loadCache), so an interrupted retry loses nothing.
       writeCacheAtomic(cf.cache, [...previous.values(), ...done.values()]);
     }
-    log.info({ input: rel(file), sites: sites.length, cached: done.size }, `\n=== ${base}: ${sites.length} sites (${done.size} cached) ===`);
+    log.info({ input: rel(file), sites: sites.length, cached: done.size }, `\n=== ${layout.id}: ${sites.length} sites (${done.size} cached) ===`);
 
     let n = sites.filter((s) => done.has(s)).length;
     const limit = pLimit(opts.concurrency);
@@ -207,12 +202,13 @@ async function processFile(file: string, opts: RunOptions, retryFailed: boolean,
     // Outputs use the current rules even for cached rows; the cache file keeps what was scraped.
     const checked = new Map([...done].map(([site, r]) => [site, recheckSite(r)]));
     const rows = buildRows(sites, checked);
+    fs.mkdirSync(layout.emailsDir, { recursive: true });
     fs.writeFileSync(outFile, stringify(rows, { header: true, columns: ['name', 'email', 'website', 'link'] }));
     const withEmails = sites.filter((s) => (checked.get(s)?.emails.length ?? 0) > 0).length;
     const failed = sites.filter((s) => { const r = checked.get(s); return r?.error && !r.emails.length; }).length;
     log.info({ output: rel(outFile), emails: rows.length, withEmails, failed }, `=> ${rel(outFile)}: ${rows.length} emails from ${withEmails}/${sites.length} sites (${failed} failed/unreachable)`);
     const mode = summaryOnly ? 'summary rebuilt from cache' : `${retryFailed ? 'retry-failed' : 'scrape'}: ${describe(opts)}`;
-    writeSummary(base, sites, checked, rows.length, mode, startedAt);
+    writeSummary(layout, sites, checked, rows.length, mode, startedAt);
     if (!summaryOnly) endScrape(cf);
   } finally {
     release();
@@ -220,24 +216,21 @@ async function processFile(file: string, opts: RunOptions, retryFailed: boolean,
 }
 
 /**
- * --unique: every email once across the given output CSVs, written to emails/unique/<label>.csv.
- * Reads finished outputs only; per-file CSVs and caches are left alone and nothing is scraped.
+ * --unique: every email once across the given output CSVs, written to `outFile`. Reads finished outputs only;
+ * per-file CSVs and caches are left alone and nothing is scraped. `label` names the combined file and its log.
  */
-function writeUnique(bases: string[]): void {
+function writeUnique(inputs: { id: string; file: string }[], label: string, outFile: string, logDir: string): void {
   const startedAt = Date.now();
   const files: { base: string; rows: Row[] }[] = [];
   const missing: string[] = [];
-  for (const base of [...bases].sort()) {
-    const f = path.join(OUT_DIR, `${base}.csv`);
-    if (!fs.existsSync(f)) { missing.push(base); continue; }
-    const rows = parse(fs.readFileSync(f), { columns: true, skip_empty_lines: true, bom: true }) as Record<string, string>[];
-    files.push({ base, rows: rows.filter((r) => r.email).map((r) => [r.name ?? '', r.email, r.website ?? '', r.link ?? '']) });
+  for (const { id, file } of inputs) {
+    if (!fs.existsSync(file)) { missing.push(id); continue; }
+    const rows = parse(fs.readFileSync(file), { columns: true, skip_empty_lines: true, bom: true }) as Record<string, string>[];
+    files.push({ base: id, rows: rows.filter((r) => r.email).map((r) => [r.name ?? '', r.email, r.website ?? '', r.link ?? '']) });
   }
   if (missing.length) log.warn({ missing }, `--unique: no output yet for ${missing.join(', ')}; skipped`);
-  if (!files.length) { log.warn('--unique: no output CSVs to combine'); return; }
+  if (!files.length) { log.warn(`--unique ${label}: no output CSVs to combine`); return; }
 
-  const label = uniqueLabel(files.map((f) => f.base));
-  const outFile = path.join(OUT_DIR, 'unique', `${label}.csv`);
   const { rows, read, overlaps } = uniqueRows(files);
   fs.mkdirSync(path.dirname(outFile), { recursive: true });
   fs.writeFileSync(outFile, stringify(rows, { header: true, columns: ['name', 'email', 'website', 'link'] }));
@@ -251,9 +244,38 @@ function writeUnique(bases: string[]): void {
     ...(top.length ? [`  Overlap  : ${top.map(([k, n]) => `${k} ${n}`).join('; ')}`] : []),
     '',
   ].join('\n');
-  fs.mkdirSync(SUMMARY_DIR, { recursive: true });
-  fs.appendFileSync(path.join(SUMMARY_DIR, `unique.${label}.log`), text + '\n');
+  fs.mkdirSync(logDir, { recursive: true });
+  fs.appendFileSync(path.join(logDir, `unique.${label}.log`), text + '\n');
   log.info({ output: path.relative(ROOT, outFile), files: files.length, rowsRead: read, uniqueEmails: rows.length }, '\n' + text);
+}
+
+/**
+ * --unique with no files: one combined list per group folder, written inside it (emails/<group>/unique/<group>.csv).
+ * With files: the files' own group if they share one (emails/<group>/unique/<label>.csv), else a cross-group list
+ * in emails/unique/, the only output that lives outside a group folder.
+ */
+function runUnique(fileArgs: string[]): void {
+  if (!fileArgs.length) {
+    for (const [group, csvs] of findOutputs(OUT_DIR)) {
+      const l = fileLayout(group, group);
+      writeUnique(csvs.map((file) => ({ id: path.basename(file, '.csv'), file })), group, path.join(l.uniqueDir, `${group}.csv`), l.logDir);
+    }
+    return;
+  }
+  const items = fileArgs.map((f) => {
+    const group = groupOf(f);
+    const base = path.basename(f, path.extname(f));
+    return { group, id: `${group}/${base}`, file: fileLayout(group, base).outFile };
+  });
+  const uniq = [...new Map(items.map((i) => [i.id, i])).values()].sort((a, b) => a.id.localeCompare(b.id));
+  const groups = new Set(uniq.map((i) => i.group));
+  const label = uniqueLabel(uniq.map((i) => path.basename(i.file, '.csv')));
+  if (groups.size === 1) {
+    const l = fileLayout([...groups][0], label);
+    writeUnique(uniq, label, path.join(l.uniqueDir, `${label}.csv`), l.logDir);
+  } else {
+    writeUnique(uniq, label, path.join(OUT_DIR, 'unique', `${label}.csv`), path.join(OUT_DIR, 'logs'));
+  }
 }
 
 async function main() {
@@ -276,10 +298,7 @@ async function main() {
   if (flags.has('unique')) {
     const other = ['force', 'retry-failed', 'summary-only', 'quick'].filter((f) => flags.has(f));
     if (other.length) throw new Error(`--unique only combines existing outputs; it can't be used with --${other.join(', --')}`);
-    const bases = fileArgs.length
-      ? fileArgs.map((f) => path.basename(f, path.extname(f)))
-      : (fs.existsSync(OUT_DIR) ? fs.readdirSync(OUT_DIR) : []).filter((f) => f.toLowerCase().endsWith('.csv')).map((f) => path.basename(f, path.extname(f)));
-    writeUnique([...new Set(bases)]);
+    runUnique(fileArgs);
     return;
   }
   const base = flags.has('quick') ? QUICK_OPTIONS : DEFAULT_OPTIONS;
@@ -297,31 +316,37 @@ async function main() {
   if (!summaryOnly) log.info(`Crawl options: ${describe(opts)}`);
   const files = fileArgs.map((f) => path.resolve(f));
   if (!files.length && !fs.existsSync(IN_DIR)) throw new Error(`No input files given and ${path.relative(ROOT, IN_DIR)}/ does not exist`);
-  const targets = files.length
-    ? files
-    : fs.readdirSync(IN_DIR).filter((f) => f.toLowerCase().endsWith('.csv')).sort().map((f) => path.join(IN_DIR, f));
-  const byBase = new Map<string, string>();
-  for (const f of targets) {
-    const b = path.basename(f, path.extname(f));
-    if (byBase.has(b)) throw new Error(`${byBase.get(b)} and ${f} would both write emails/${b}.csv; rename one`);
-    byBase.set(b, f);
+  const targets = (files.length ? files : findInputs(IN_DIR)).map((f) => {
+    const layout = fileLayout(groupOf(f), path.basename(f, path.extname(f)));
+    return { file: f, layout };
+  });
+  const byOut = new Map<string, string>();
+  for (const { file, layout } of targets) {
+    const prev = byOut.get(layout.outFile);
+    if (prev) throw new Error(`${prev} and ${file} would both write ${path.relative(ROOT, layout.outFile)}; rename one`);
+    byOut.set(layout.outFile, file);
+  }
+  // An uncategorized list gets a folder named after it; if that name is also a category, the two share the folder.
+  const categories = new Set(targets.map((t) => categoryOf(t.file)).filter(Boolean));
+  for (const { file, layout } of targets) {
+    if (!categoryOf(file) && categories.has(layout.group)) {
+      log.warn({ input: path.relative(ROOT, file) }, `${path.basename(file)} has no category but shares emails/${layout.group}/ with the "${layout.group}" category`);
+    }
   }
 
   fs.mkdirSync(OUT_DIR, { recursive: true });
-  for (const f of targets) {
+  for (const { file: f, layout } of targets) {
     if (!fs.existsSync(f)) { log.error({ input: f }, `Not found: ${f}`); continue; }
-    const base = path.basename(f, path.extname(f));
-    const out = path.join(OUT_DIR, base + '.csv');
-    const interrupted = fs.existsSync(cacheFiles(CACHE_DIR, base).marker);
-    if (!files.length && !force && !retryFailed && !summaryOnly && fs.existsSync(out) && !interrupted) {
-      log.info({ input: path.relative(ROOT, f) }, `Skipping ${path.basename(f)} (output exists; use --force)`);
+    const interrupted = fs.existsSync(cacheFiles(layout.cacheDir, layout.base).marker);
+    if (!files.length && !force && !retryFailed && !summaryOnly && fs.existsSync(layout.outFile) && !interrupted) {
+      log.info({ input: path.relative(ROOT, f) }, `Skipping ${path.relative(IN_DIR, f)} (output exists; use --force)`);
       continue;
     }
     try {
-      await withLogContext({ file: base }, () => processFile(f, opts, retryFailed, summaryOnly));
+      await withLogContext({ file: layout.id }, () => processFile(f, layout, opts, retryFailed, summaryOnly));
     } catch (err) {
       if (!(err instanceof LockedError)) throw err;
-      log.error({ input: path.relative(ROOT, f), err }, `Skipping ${path.basename(f)}: ${err.message}`);
+      log.error({ input: path.relative(ROOT, f), err }, `Skipping ${path.relative(IN_DIR, f)}: ${err.message}`);
     }
   }
   await closeBrowser();
