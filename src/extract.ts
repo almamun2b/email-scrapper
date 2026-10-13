@@ -34,9 +34,14 @@ export function findEmails(text: string): string[] {
     DOMAIN_AT.lastIndex = at;
     const m = DOMAIN_AT.exec(text);
     if (!m) continue;
+    // Text glued on after the address ("info@acme.co.nzPhone") starts with a capital: the last label ends there.
+    let domain = m[0];
+    const last = domain.lastIndexOf('.') + 1;
+    const glued = /[a-z][A-Z]/.exec(domain.slice(last));
+    if (glued) domain = domain.slice(0, last + glued.index + 1);
     // a JSON/JS string escape right before the address ("\ndavid@…") is not part of it
-    out.push((text[localStart - 1] === '\\' && /^[nrtfbv]/.test(local) ? local.slice(1) : local) + m[0]);
-    from = at + m[0].length;
+    out.push((text[localStart - 1] === '\\' && /^[nrtfbv]/.test(local) ? local.slice(1) : local) + domain);
+    from = at + domain.length;
   }
   return out;
 }
@@ -44,11 +49,13 @@ export function findEmails(text: string): string[] {
 const BAD_TLD_SUFFIX =
   /\.(png|jpe?g|gif|svg|webp|avif|ico|bmp|css|js|json|woff2?|ttf|eot|otf|mp4|mp3|pdf|php|html?|aspx?)$/i;
 
+// Placeholder domains in any of the usual forms (email.com, company.com.au, test.co.nz …), website-builder and
+// form-relay platforms, and a domain-parking service whose privacy address sits on every parked domain.
 const JUNK_DOMAINS =
-  /(^|\.)(example\.(com|org|net)|domain\.(com|co\.nz)|yourdomain\.[a-z.]+|test\.com|sentry\.io|sentry-next\.wixpress\.com|wixpress\.com|wix\.com|godaddy\.com|sentry\.wixpress\.com|mysite\.com|yoursite\.com|website\.com|company\.com|placeholder\.com|schema\.org|w3\.org|localhost)$/i;
+  /(^|\.)((example|domain|yourdomain|yourcompany|yourbusiness|test|mysite|yoursite|website|company|business|email|placeholder)\.(com|net|org|co)(\.(au|nz|uk))?|yourdomain\.[a-z.]+|sentry\.io|sentry-next\.wixpress\.com|wixpress\.com|wix\.com|godaddy\.com|sentry\.wixpress\.com|squarespace\.com|contactforms\.podium\.com|above\.com|schema\.org|w3\.org|localhost)$/i;
 
 const JUNK_LOCAL =
-  /^(email|your-?email|your-?name|name|yourname|user(name)?|first\.?last|firstname\.?lastname|someone|john\.?doe|jane\.?doe|test|example|sample|noreply|no-reply|donotreply|do-not-reply|mailer-daemon|postmaster|xxx+|abc|foo|bar)$/i;
+  /^(email|your-?email|your[.-]?name|name|yourname|you|your|recipient|name\.?surname|user(name)?|first\.?last|firstname\.?lastname|someone|john\.?doe|jane\.?doe|test|example|sample|noreply|no-reply|donotreply|do-not-reply|mailer-daemon|postmaster|xxx+|abc|foo|bar)$/i;
 
 const GENERIC_LOCAL = new Set([
   'info', 'admin', 'administrator', 'reception', 'receptionist', 'contact', 'contactus', 'enquiries', 'enquiry',
@@ -106,6 +113,7 @@ export function cleanEmail(raw: string): string | null {
   }
   if (JUNK_DOMAINS.test(domain)) return null;
   if (JUNK_LOCAL.test(local)) return null;
+  if (/^\.|\.$|\.\./.test(local)) return null; // not a valid address
   if (/^[0-9a-f]{24,}$/.test(local)) return null; // hash-like
   if (/^[0-9a-f]{8}-[0-9a-f]{4}-/.test(local)) return null; // uuid
   if (domain.split('.').some((p) => p.length > 40)) return null;
@@ -265,6 +273,19 @@ const ldType = (n: any) => ([] as string[]).concat(n['@type'] ?? []).join(' ');
 
 // ---------- business name ----------
 
+const GENERIC_NAME = /^(home|home ?page|welcome|untitled|index|default|website|my blog|just another .*)$/i;
+
+/**
+ * A business name tidied for output: a leading "Welcome to", an address after a comma ("…, 1/123 Main Road") and
+ * generic segments ("Home | Acme") removed. Null when nothing usable is left.
+ */
+export function tidyBusinessName(raw: string): string | null {
+  const segs = raw.replace(/\s+/g, ' ').trim().split(/\s+[|–—•·:]\s+|\s+-\s+/);
+  const kept = segs.map((s) => s.replace(/^welcome to\s+/i, '').replace(/,\s*\d.*$/, '').trim()).filter((s) => s && !GENERIC_NAME.test(s));
+  const v = kept.join(' | ');
+  return v.length >= 2 && v.length <= 80 ? v : null;
+}
+
 export function businessName(html: string, host: string): string {
   const $ = cheerio.load(html);
   const candidates: string[] = [];
@@ -281,8 +302,8 @@ export function businessName(html: string, host: string): string {
 
   const clean = (s: string) => s.replace(/\s+/g, ' ').trim();
   for (const c of candidates) {
-    const v = clean(c);
-    if (v.length >= 2 && v.length <= 80) return v;
+    const v = tidyBusinessName(c);
+    if (v) return v;
   }
 
   const title = clean($('title').first().text());
@@ -292,8 +313,9 @@ export function businessName(html: string, host: string): string {
     // short segments ("NZ", "Home") would match almost any domain
     const match = segs.find((s) => baseKey(s).length >= 4 && (baseKey(s).includes(domainKey) || domainKey.includes(baseKey(s))));
     const generic = /^(home|welcome|homepage|contact|about)/i;
-    const pick = match ?? segs.filter((s) => !generic.test(s)).sort((a, b) => a.length - b.length)[0] ?? segs[0];
-    if (pick && pick.length <= 80) return pick;
+    const pick = match ?? segs.filter((s) => !generic.test(s)).sort((a, b) => a.length - b.length)[0];
+    const v = pick && tidyBusinessName(pick);
+    if (v) return v;
   }
   return host.replace(/^www\./, '');
 }
@@ -461,6 +483,11 @@ export function extractFromDom($: CheerioAPI, html: string): Found[] {
 
 // ---------- re-checking stored results ----------
 
+/** Page titles that name no department ("Contact Us"): a row with one falls back to the business name. */
+export function isGenericTitle(title: string): boolean {
+  return /^(contact|contact us|contacts|about|about us|home|welcome|enquiries|get in touch)$/i.test(title.trim());
+}
+
 /**
  * Whether a stored name was derived from the email's local part rather than read off the page. Rows from
  * before `nameFrom` existed are judged by shape: a name that is just the title-cased local part.
@@ -490,6 +517,8 @@ export function recheckRow<T extends Found>(row: T): T | null {
   if (name) out.nameFrom = row.nameFrom ?? 'page';
   else if (fromLocal) out.nameFrom = 'local';
   else delete out.nameFrom;
+  const withTitle = out as T & { pageTitle?: string };
+  if (withTitle.pageTitle && isGenericTitle(withTitle.pageTitle)) delete withTitle.pageTitle;
   return out;
 }
 

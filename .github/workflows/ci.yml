@@ -7,13 +7,20 @@ on:
 jobs:
   check:
     runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        node-version: [22, 24]
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with:
-          node-version: 22
+          node-version: ${{ matrix.node-version }}
           cache: npm
       - run: npm ci
       - run: npm run typecheck
-      # The browser-fallback test skips itself when Chromium isn't installed.
+      # Chromium for the browser tests. Ubuntu runners restrict unprivileged user namespaces, which
+      # Chromium's sandbox needs, so the tests run it without the sandbox here.
+      - run: npx playwright install --with-deps chromium
       - run: npm test
+        env:
+          SCRAPER_NO_SANDBOX: '1'

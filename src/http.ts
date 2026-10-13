@@ -1,7 +1,9 @@
 import { setTimeout as sleep } from 'node:timers/promises';
 import pLimit from 'p-limit';
+import { Agent, fetch } from 'undici';
+import { untilAborted } from './abort.js';
 import { log } from './logger.js';
-import { isPublicHost } from './netguard.js';
+import { guardedLookup, isPublicHost } from './netguard.js';
 import { baseHost } from './urls.js';
 
 export const UA =
@@ -12,8 +14,11 @@ const MAX_BYTES = 5 * 1024 * 1024;
 const MAX_REDIRECTS = 10;
 const RETRY_AFTER_MS = 3_000; // wait before the one retry, unless the server's Retry-After says otherwise
 const MAX_RETRY_AFTER_MS = 30_000;
-// Network errors that won't go away 3 seconds later: no such host, nothing listening, broken TLS.
-const PERMANENT_NET_ERROR = /^(ENOTFOUND|EAI_NONAME|ECONNREFUSED|EHOSTUNREACH|ENETUNREACH)$|CERT|TLS|SSL/i;
+// Network errors that won't go away 3 seconds later: no such host, nothing listening, broken TLS, a private address.
+const PERMANENT_NET_ERROR = /^(ENOTFOUND|EAI_NONAME|ECONNREFUSED|EHOSTUNREACH|ENETUNREACH|EBLOCKED)$|CERT|TLS|SSL/i;
+
+// Connections resolve through the address guard, so they go to the addresses it checked (no DNS rebinding).
+const dispatcher = new Agent({ connect: { lookup: guardedLookup } });
 
 export interface HttpResult {
   status: number;
@@ -21,6 +26,7 @@ export interface HttpResult {
   type: string; // content-type header
   body: string; // decoded text; empty for error statuses and skipped content types
   bytes: Buffer; // raw body (gzip sitemaps are binary)
+  disallowed?: boolean; // a redirect led to `url`, which allowHop refused: not requested (status 0)
 }
 
 export interface GetOptions {
@@ -28,6 +34,21 @@ export interface GetOptions {
   types?: RegExp; // content types worth reading; anything else is not downloaded
   signal?: AbortSignal;
   onRateLimited?: (url: string, status: number) => void; // still 429/503 after the retry; the page is skipped
+  allowHop?: (url: string) => Promise<boolean>; // asked before following each redirect (robots.txt of the target)
+  onFail?: (kind: FailKind) => void; // why a request got no answer (the last reason wins when it was retried)
+}
+
+/** Why a request got no answer: no such host, nothing listening, broken TLS, a private address, … */
+export type FailKind = 'dns' | 'refused' | 'tls' | 'timeout' | 'reset' | 'private' | 'redirects' | 'network';
+
+export function failKind(code: string): FailKind {
+  if (/^(ENOTFOUND|EAI_NONAME|EAI_AGAIN|EAI_FAIL|EAI_NODATA)$/.test(code)) return 'dns';
+  if (code === 'ECONNREFUSED') return 'refused';
+  if (code === 'EBLOCKED') return 'private';
+  if (/CERT|TLS|SSL/i.test(code)) return 'tls';
+  if (/TIMEOUT|ETIMEDOUT/i.test(code)) return 'timeout';
+  if (/ECONNRESET|EPIPE|SOCKET/i.test(code)) return 'reset';
+  return 'network';
 }
 
 // ---------------- per-server limits ----------------
@@ -85,11 +106,32 @@ function hostLimit(host: string): ReturnType<typeof pLimit> {
 /** Inside a host slot: waits until this server's gap (Crawl-delay or backoff) since the previous request has passed. */
 async function waitTurn(host: string, signal?: AbortSignal): Promise<void> {
   const gap = hostGapMs(host);
-  if (!gap) return;
+  if (!gap || signal?.aborted) return;
   const now = Date.now();
   const at = Math.max(now, nextSlot.get(host) ?? 0);
   nextSlot.set(host, at + gap);
   if (at > now) await sleep(at - now, undefined, { signal }).catch(() => {});
+}
+
+/**
+ * Runs `fn` in one of the server's slots, after its gap (Crawl-delay or rate-limit backoff). The HTTP client and
+ * the headless browser both use it, so one server sees the same limits from either. Gives null as soon as
+ * `signal` aborts, even while still queued for a slot that other sites' requests hold.
+ */
+export function withHostSlot<T>(hostname: string, signal: AbortSignal | undefined, fn: () => Promise<T>): Promise<T | null> {
+  const host = baseHost(hostname);
+  const run = hostLimit(host)(async () => {
+    if (signal?.aborted) return null;
+    await waitTurn(host, signal);
+    if (signal?.aborted) return null;
+    return fn();
+  });
+  return untilAborted(run, signal, null);
+}
+
+/** Feeds a server's answer into its rate-limit backoff (see pace). */
+export function notePace(hostname: string, status: number): void {
+  pace(baseHost(hostname), status === 429 || status === 503);
 }
 
 // ---------------- requests ----------------
@@ -148,19 +190,20 @@ async function once(url: string, opts: GetOptions): Promise<HttpResult | null | 
   for (let hop = 0; hop <= MAX_REDIRECTS; hop++) {
     const u = new URL(current);
     if (!/^https?:$/.test(u.protocol)) return null;
+    if (hop > 0 && opts.allowHop && !(await opts.allowHop(current))) {
+      return { status: 0, url: current, type: '', body: '', bytes: Buffer.alloc(0), disallowed: true };
+    }
     if (!(await isPublicHost(u.hostname))) {
       log.debug({ url: current, from: url }, 'refusing a request to a private or local address');
+      opts.onFail?.('private');
       return null;
     }
-    const host = baseHost(u.hostname);
-    const r = await hostLimit(host)(async () => {
-      await waitTurn(host, opts.signal);
-      return request(current, opts);
-    });
+    const r = await withHostSlot(u.hostname, opts.signal, () => request(current, opts));
     if (typeof r !== 'object' || r === null || !('redirect' in r)) return r;
     current = r.redirect;
   }
   log.debug({ url }, 'too many redirects');
+  opts.onFail?.('redirects');
   return null;
 }
 
@@ -170,6 +213,7 @@ async function request(url: string, opts: GetOptions): Promise<HttpResult | null
   const signal = opts.signal ? AbortSignal.any([opts.signal, timeout]) : timeout;
   try {
     const res = await fetch(url, {
+      dispatcher,
       signal,
       redirect: 'manual',
       headers: {
@@ -178,12 +222,12 @@ async function request(url: string, opts: GetOptions): Promise<HttpResult | null
         'accept-language': 'en-AU,en-NZ;q=0.9,en;q=0.8',
       },
     });
-    pace(baseHost(new URL(url).hostname), res.status === 429 || res.status === 503);
+    notePace(new URL(url).hostname, res.status);
     const type = res.headers.get('content-type') ?? '';
     const result = (body = '', bytes = Buffer.alloc(0)): HttpResult => ({ status: res.status, url, type, body, bytes });
     // Always release an unread body: cheerio loads npm undici, which then backs global fetch, and
     // an abandoned body on a connection the server closes crashes the process (undici Parser.finish assertion).
-    const release = () => res.body?.cancel().catch(() => {});
+    const release = async () => { await res.body?.cancel().catch(() => {}); };
     if (res.status >= 300 && res.status < 400 && res.headers.get('location')) {
       await release();
       try {
@@ -222,10 +266,12 @@ async function request(url: string, opts: GetOptions): Promise<HttpResult | null
     if (opts.signal?.aborted) return null;
     if (timeout.aborted) {
       log.debug({ url, timeoutMs: HTTP_TIMEOUT }, 'request timed out');
+      opts.onFail?.('timeout');
       return null;
     }
     const code = String((err as { cause?: { code?: string } })?.cause?.code ?? '');
     log.debug({ url, err, code }, 'network error');
+    opts.onFail?.(failKind(code));
     return PERMANENT_NET_ERROR.test(code) ? null : new Retry(null);
   }
 }

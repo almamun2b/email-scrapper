@@ -7,9 +7,10 @@ export type Route =
   | string
   | { status?: number; type?: string; body?: string | Buffer; headers?: Record<string, string>; redirect?: string; delayMs?: number };
 
-/** Local site for crawler tests. Unknown paths are 404s; every request path is recorded in `hits`. */
-export async function startServer(routes: Record<string, Route>, host = '127.0.0.1'): Promise<{ url: string; hits: string[]; close: () => Promise<void> }> {
+/** Local site for crawler tests. Unknown paths are 404s; every request path is recorded in `hits`, with its time in `times`. */
+export async function startServer(routes: Record<string, Route>, host = '127.0.0.1'): Promise<{ url: string; hits: string[]; times: number[]; close: () => Promise<void> }> {
   const hits: string[] = [];
+  const times: number[] = []; // when each hit arrived, in the same order
   const send = (res: http.ServerResponse, route: Exclude<Route, string>) => {
     if (res.destroyed) return;
     if (route.redirect) {
@@ -25,6 +26,7 @@ export async function startServer(routes: Record<string, Route>, host = '127.0.0
   const srv = http.createServer((req, res) => {
     const path = req.url ?? '/';
     hits.push(path);
+    times.push(Date.now());
     const r = routes[path];
     if (r === undefined) {
       res.statusCode = 404;
@@ -39,6 +41,7 @@ export async function startServer(routes: Record<string, Route>, host = '127.0.0
   return {
     url: `http://${host}:${port}`,
     hits,
+    times,
     close: () => new Promise((resolve) => { srv.closeAllConnections(); srv.close(() => resolve()); }),
   };
 }

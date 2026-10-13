@@ -16,6 +16,7 @@ export interface FileLayout {
   cacheDir: string;
   logDir: string;
   uniqueDir: string;
+  sharedFile: string; // emails found on many sites that don't own them (assignRows)
 }
 
 /** Folder inside a group that holds its output CSVs (emails/<group>/emails/*.csv). */
@@ -55,6 +56,7 @@ export function fileLayout(group: string, base: string, outDir = OUT_DIR): FileL
     cacheDir: path.join(groupDir, '.cache'),
     logDir: path.join(groupDir, 'logs'),
     uniqueDir: path.join(groupDir, 'unique'),
+    sharedFile: path.join(groupDir, 'shared', `${base}.csv`),
   };
 }
 

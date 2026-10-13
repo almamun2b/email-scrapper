@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { businessName, cleanEmail, demoteRolePrefixes, extractFromHtml, nameFromLocal, personName, recheckRow, type Found } from '../src/extract.js';
+import { businessName, cleanEmail, demoteRolePrefixes, extractFromHtml, findEmails, nameFromLocal, personName, recheckRow, tidyBusinessName, type Found } from '../src/extract.js';
 
 const byEmail = (html: string) => Object.fromEntries(extractFromHtml(html).map((f) => [f.email, f.name]));
 
@@ -77,7 +77,7 @@ test('many emails on a big page are fast (M6)', () => {
 // ---------- TLDs and ROT13 (H5) ----------
 
 test('real gTLDs outside the old whitelist are kept (H5)', () => {
-  for (const e of ['bookings@rotorua.travel', 'sales@kiwi.cars', 'info@dealer.auto', 'info@x.tours', 'jo@x.law', 'a@b.global', 'hi@x.media', 'me@email.com']) {
+  for (const e of ['bookings@rotorua.travel', 'sales@kiwi.cars', 'info@dealer.auto', 'info@x.tours', 'jo@x.law', 'a@b.global', 'hi@x.media']) {
     assert.equal(cleanEmail(e), e);
   }
 });
@@ -183,4 +183,38 @@ test('a page-confirmed name survives re-checking even with an unlisted first nam
 test('old rows: names the old local-part rule could not produce are treated as page names', () => {
   assert.equal(recheckRow({ email: 'craig.hammermeister@x.com.au', name: 'Craig Hammermeister' })!.name, 'Craig Hammermeister');
   assert.equal(recheckRow({ email: 'rex.xu@x.com.au', name: 'Rex Xu' })!.name, 'Rex Xu');
+});
+
+// ---------- audit 2026-10-13 ----------
+
+test('placeholder and platform addresses seen in the caches are dropped (D2)', () => {
+  for (const e of ['you@email.com', 'your@email.com', 'jane@email.com', 'info@email.com', 'customer@email.com', 'you@company.com.au',
+    'your@business.com', 'jane.smith@test.com.au', 'somethingtotest@test.com.au', 'privacy@squarespace.com', '195123@contactforms.podium.com',
+    'privacy@above.com', 'recipient@acme.co.nz', 'name.surname@acme.co.nz', 'info@example.co.nz', 'info@yourcompany.com']) {
+    assert.equal(cleanEmail(e), null, e);
+  }
+  for (const e of ['info@emailmarketing.com.au', 'jo@testsafe.co.nz', 'yolanda@acme.co.nz', 'info@bigbusiness.com.au']) assert.equal(cleanEmail(e), e);
+});
+
+test('local parts with a leading, trailing or doubled dot are not addresses (D4)', () => {
+  assert.equal(cleanEmail('john..smith@acme.co.nz'), null);
+  assert.equal(cleanEmail('john.@acme.co.nz'), null);
+  assert.equal(cleanEmail('.john@acme.co.nz'), 'john@acme.co.nz'); // leading punctuation is trimmed, as before
+});
+
+test('text glued on after an address does not lose it (B11)', () => {
+  assert.deepEqual(findEmails('Email info@acme.co.nzPhone 09 123'), ['info@acme.co.nz']);
+  assert.deepEqual(findEmails('sales@acme.comMobile'), ['sales@acme.com']);
+  assert.deepEqual(findEmails('INFO@ACME.CO.NZ and Info@Acme.Co.Nz'), ['INFO@ACME.CO.NZ', 'Info@Acme.Co.Nz']);
+  assert.deepEqual(Object.keys(byEmail('<p>E: info@acme.co.nzPh: 09 123</p>')), ['info@acme.co.nz']);
+});
+
+test('business names drop "Home", "Welcome to" and trailing addresses (D3)', () => {
+  assert.equal(tidyBusinessName('Home'), null);
+  assert.equal(tidyBusinessName('HOME'), null);
+  assert.equal(tidyBusinessName('Welcome to The Denture Place'), 'The Denture Place');
+  assert.equal(tidyBusinessName('Home | Panthers Menswear Gippsland'), 'Panthers Menswear Gippsland');
+  assert.equal(tidyBusinessName('Welcome to DW Family Doctors, 1/123 Pakuranga Road, Pakuranga, Auckland'), 'DW Family Doctors');
+  assert.equal(businessName('<meta property="og:site_name" content="Home"><title>Acme Dental | Home</title>', 'acmedental.co.nz'), 'Acme Dental');
+  assert.equal(businessName('<title>Home</title>', 'www.acme.co.nz'), 'acme.co.nz');
 });

@@ -1,14 +1,18 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
+import { parse } from 'csv-parse/sync';
 import os from 'node:os';
 import path from 'node:path';
-import { acquireLock, beginScrape, budgetRetry, cacheFiles, endScrape, ensureTrailingNewline, failedRetry, loadCache, LockedError, planRetries, rateLimitedRetry, writeCacheAtomic } from '../src/cache.js';
-import { parseArgs, rawFlag, retryOptions } from '../src/cli.js';
+import { acquireLock, beginScrape, budgetRetry, cacheFiles, cappedRetry, endScrape, ensureTrailingNewline, failedRetry, loadCache, LockedError, planRetries, rateLimitedRetry, writeCacheAtomic, writeFileAtomic } from '../src/cache.js';
+import { BOOLEAN_FLAGS, INTEGER_FLAGS, NUMBER_FLAGS, OPTIONAL_NUMBER_FLAGS, parseArgs, rawFlag, retryOptions, STRING_FLAGS, USAGE } from '../src/cli.js';
+import { setMxResolver, undeliverable } from '../src/mx.js';
 import type { SiteResult } from '../src/crawler.js';
 import { readSites } from '../src/input.js';
-import { buildRows, safeCell, uniqueLabel, uniqueRows } from '../src/output.js';
+import { assignRows, recheckSite, safeCell, uniqueLabel, uniqueRows } from '../src/output.js';
 import { categoryOf, fileLayout, findInputs, findOutputs, groupOf } from '../src/paths.js';
+import { previewFile, processFile, staleState } from '../src/run.js';
+import { DEFAULT_OPTIONS } from '../src/crawler.js';
 
 const tmp = () => fs.mkdtempSync(path.join(os.tmpdir(), 'scraper-test-'));
 const site = (s: string, extra: Partial<SiteResult> = {}): SiteResult => ({
@@ -52,8 +56,8 @@ test('--retry-budget-queued takes minutes as --x=N, --x N, or none; a file after
 });
 
 test('retryOptions: the three retries are independent, and the budget is given once', () => {
-  assert.deepEqual(retryOptions(parseArgs(['--retry-failed', '--retry-rate-limited'])), { failed: true, rateLimited: true, budget: false, budgetMin: undefined });
-  assert.deepEqual(retryOptions(parseArgs(['--retry-budget-queued=45'])), { failed: false, rateLimited: false, budget: true, budgetMin: 45 });
+  assert.deepEqual(retryOptions(parseArgs(['--retry-failed', '--retry-rate-limited'])), { failed: true, rateLimited: true, budget: false, capped: false, budgetMin: undefined });
+  assert.deepEqual(retryOptions(parseArgs(['--retry-budget-queued=45'])), { failed: false, rateLimited: false, budget: true, capped: false, budgetMin: 45 });
   assert.equal(retryOptions(parseArgs(['--retry-budget-queued', '--budget=30'])).budgetMin, undefined);
   assert.throws(() => retryOptions(parseArgs(['--retry-budget-queued=60', '--budget=30'])), /give it once/);
 });
@@ -75,6 +79,13 @@ function csv(text: string): string {
 test('readSites: exact header', () => {
   const r = readSites(csv('name,website\nA,a.co.nz\nB,https://b.co.nz/\n'));
   assert.deepEqual(r.sites, ['https://a.co.nz/', 'https://b.co.nz/']);
+});
+
+test("readSites: the input's name column is read per site", () => {
+  const r = readSites(csv('website,name\na.co.nz,  Acme   Dental \nb.co.nz,\n'));
+  assert.deepEqual([...r.names], [['https://a.co.nz/', 'Acme Dental']]);
+  assert.deepEqual([...readSites(csv('Business Name,Website\nAcme,a.co.nz\n')).names], [['https://a.co.nz/', 'Acme']]);
+  assert.equal(readSites(csv('a.co.nz,Acme\n')).names.size, 0); // no header row, no name column
 });
 
 test('readSites: fuzzy header such as "Company Website" (M12)', () => {
@@ -192,7 +203,7 @@ test('retry predicates: failures, rate-limited pages and time-budget queues; nev
   assert.equal(budgetRetry(site('a', { error: 'robots-disallowed', budgetQueued: 3 })), false);
 });
 
-test('planRetries: saved state is continued, rows without it are crawled again keeping the better result', () => {
+test('planRetries: saved state is continued, rows without it are crawled again keeping the old row', () => {
   const emails = [{ email: 'a@b.nz', name: null, link: 'x' }];
   const st = { queued: [['https://n.nz/q', 2]] as [string, number][], limited: [['https://n.nz/l', 2]] as [string, number][], attempts: 9 };
   const done = new Map<string, SiteResult>([
@@ -205,14 +216,14 @@ test('planRetries: saved state is continued, rows without it are crawled again k
   const all = planRetries(done, { failed: true, rateLimited: true, budget: true });
   assert.deepEqual([...all.recrawl].sort(), ['f', 'old']);
   assert.deepEqual([...all.previous.keys()], ['old']);
-  assert.deepEqual(Object.fromEntries(all.resume), { new: { budget: true, limited: true } });
+  assert.deepEqual(Object.fromEntries(all.resume), { new: { budget: true, limited: true, capped: false } });
 
   const budgetOnly = planRetries(done, { failed: false, rateLimited: false, budget: true });
   assert.deepEqual([...budgetOnly.recrawl], ['old']);
-  assert.deepEqual(Object.fromEntries(budgetOnly.resume), { new: { budget: true, limited: false } });
+  assert.deepEqual(Object.fromEntries(budgetOnly.resume), { new: { budget: true, limited: false, capped: false } });
 
   const limitedOnly = planRetries(done, { failed: false, rateLimited: true, budget: false });
-  assert.deepEqual(Object.fromEntries(limitedOnly.resume), { new: { budget: false, limited: true } });
+  assert.deepEqual(Object.fromEntries(limitedOnly.resume), { new: { budget: false, limited: true, capped: false } });
   // a v3 row with only rate-limited pages left is not picked by the budget retry
   assert.equal(planRetries(new Map([['x', site('x', { v: 3, emails, resume: { ...st, queued: [] } })]]), { failed: false, rateLimited: false, budget: true }).resume.size, 0);
 });
@@ -244,15 +255,77 @@ test('safeCell neutralises formulas (M7)', () => {
   assert.equal(safeCell('Acme Dental'), 'Acme Dental');
 });
 
-test('buildRows: input order, unique by email, name fallback, formula-safe', () => {
+test('assignRows: input order, unique by email, name fallback, formula-safe', () => {
   const done = new Map<string, SiteResult>([
     ['https://a.nz/', site('https://a.nz/', { business: '=evil()', emails: [{ email: 'x@a.nz', name: null, link: 'l1' }] })],
     ['https://b.nz/', site('https://b.nz/', { emails: [{ email: 'x@a.nz', name: 'Jo Bloggs', link: 'l2' }, { email: 'y@b.nz', name: null, link: 'l3', pageTitle: 'Cardiology' }] })],
   ]);
-  assert.deepEqual(buildRows(['https://a.nz/', 'https://b.nz/', 'https://c.nz/'], done), [
+  const out = assignRows(['https://a.nz/', 'https://b.nz/', 'https://c.nz/'], done);
+  assert.deepEqual(out.rows, [
     ["'=evil()", 'x@a.nz', 'https://a.nz/', 'l1'],
     ['Cardiology', 'y@b.nz', 'https://b.nz/', 'l3'],
   ]);
+  assert.deepEqual(out.kinds, { person: 0, department: 1, input: 0, business: 1 });
+});
+
+test('assignRows credits an email to the site that owns its domain, not the first one listing it (B4)', () => {
+  const sites = ['https://www.bydhaberfield.com.au/', 'https://bydcastlehill.com.au/'];
+  const done = new Map<string, SiteResult>([
+    [sites[0], site(sites[0], { business: 'BYD Haberfield', emails: [
+      { email: 'sales@bydcastlehill.com.au', name: null, link: 'h1', source: 'raw' },
+      { email: 'sales@bydhaberfield.com.au', name: null, link: 'h2', source: 'mailto' },
+    ] })],
+    [sites[1], site(sites[1], { business: 'BYD Castle Hill', emails: [{ email: 'sales@bydcastlehill.com.au', name: null, link: 'c1', source: 'mailto' }] })],
+  ]);
+  assert.deepEqual(assignRows(sites, done).rows, [
+    ['BYD Haberfield', 'sales@bydhaberfield.com.au', sites[0], 'h2'],
+    ['BYD Castle Hill', 'sales@bydcastlehill.com.au', sites[1], 'c1'],
+  ]);
+});
+
+test('assignRows prefers a site where the email was not only in raw HTML (B4)', () => {
+  const sites = ['https://a.com.au/', 'https://b.com.au/'];
+  const done = new Map<string, SiteResult>([
+    [sites[0], site(sites[0], { emails: [{ email: 'jo@gmail.com', name: null, link: 'a', source: 'raw' }] })],
+    [sites[1], site(sites[1], { emails: [{ email: 'jo@gmail.com', name: null, link: 'b', source: 'mailto' }] })],
+  ]);
+  assert.equal(assignRows(sites, done).rows[0][2], sites[1]);
+});
+
+test('assignRows moves emails on 3+ sites that none of them owns to shared (D1)', () => {
+  const dealer = (host: string) => site(`https://${host}/`, { business: host, emails: [
+    { email: 'enquiries@oaic.gov.au', name: null, link: `https://${host}/privacy` },
+    { email: `sales@${host}`, name: null, link: `https://${host}/` },
+  ] });
+  const sites = ['https://a.com.au/', 'https://b.com.au/', 'https://c.com.au/'];
+  const done = new Map(sites.map((s) => [s, dealer(new URL(s).hostname)]));
+  const out = assignRows(sites, done);
+  assert.deepEqual(out.rows.map((r) => r[1]), ['sales@a.com.au', 'sales@b.com.au', 'sales@c.com.au']);
+  assert.deepEqual(out.shared, [['a.com.au', 'enquiries@oaic.gov.au', 'https://a.com.au/', 'https://a.com.au/privacy']]);
+  assert.equal(out.sharedOn.get('enquiries@oaic.gov.au'), 3);
+  // on only two sites it stays in the main list
+  assert.equal(assignRows(sites.slice(0, 2), done).shared.length, 0);
+  // several pages of one domain count as one site
+  const pages = ['https://a.com.au/x', 'https://a.com.au/y', 'https://a.com.au/z'];
+  assert.equal(assignRows(pages, new Map(pages.map((p) => [p, { ...dealer('a.com.au'), site: p }]))).shared.length, 0);
+});
+
+test("assignRows uses the input's own name before the scraped business name, after person and department names", () => {
+  const sites = ['https://a.nz/', 'https://b.nz/'];
+  const done = new Map<string, SiteResult>([
+    [sites[0], site(sites[0], { business: 'Home', emails: [{ email: 'info@a.nz', name: null, link: 'l' }, { email: 'jo@a.nz', name: 'Jo Bloggs', link: 'l' }] })],
+    [sites[1], site(sites[1], { business: 'B Ltd', emails: [{ email: 'info@b.nz', name: null, link: 'l', pageTitle: 'Cardiology' }] })],
+  ]);
+  const out = assignRows(sites, done, new Map([[sites[0], 'St Mary’s Church'], [sites[1], 'B Clinic']]));
+  assert.deepEqual(out.rows.map((r) => r[0]), ['St Mary’s Church', 'Jo Bloggs', 'Cardiology']);
+  assert.deepEqual(out.kinds, { person: 1, department: 1, input: 1, business: 0 });
+});
+
+test('recheckSite tidies cached business names and drops generic department titles (D3)', () => {
+  const r = recheckSite(site('https://www.acme.co.nz/', { finalUrl: 'https://www.acme.co.nz/', business: 'Home', emails: [{ email: 'info@acme.co.nz', name: null, link: 'l', pageTitle: 'Contact Us' }] }));
+  assert.equal(r.business, 'acme.co.nz');
+  assert.equal(r.emails[0].pageTitle, undefined);
+  assert.equal(recheckSite(site('https://x.nz/', { business: 'Welcome to The Denture Place' })).business, 'The Denture Place');
 });
 
 // ---------- --unique ----------
@@ -310,4 +383,125 @@ test('findInputs and findOutputs walk one level of category folders', () => {
   assert.deepEqual(findInputs(d).map((f) => path.relative(d, f)), [path.join('dealers', 'a.csv'), 'top.csv']);
   put('dealers', 'emails', 'a.csv'); put('dealers', 'top-level-ignored.csv'); put('unique', 'u.csv'); put('logs', 'l.csv'); put('.cache', 'c.csv');
   assert.deepEqual([...findOutputs(d)].map(([g, f]) => [g, f.map((x) => path.basename(x))]), [['dealers', ['a.csv']]]);
+});
+
+// ---------- audit 2026-10-13 ----------
+
+test('--budget must be more than 0 minutes (B13)', () => {
+  assert.throws(() => parseArgs(['--budget=0']), /minutes > 0/);
+  assert.equal(parseArgs(['--budget=0.5']).values.get('budget'), 0.5);
+});
+
+test('readSites reads UTF-16 files saved by Excel, and names the line of a broken CSV (B10)', () => {
+  const dir = tmp();
+  const utf16 = path.join(dir, 'u.csv');
+  fs.writeFileSync(utf16, Buffer.concat([Buffer.from([0xff, 0xfe]), Buffer.from('Name\tWebsite\r\nAcme\tacme.co.nz\r\n', 'utf16le')]));
+  assert.deepEqual(readSites(utf16).sites, ['https://acme.co.nz/']);
+  assert.deepEqual([...readSites(utf16).names], [['https://acme.co.nz/', 'Acme']]);
+  assert.deepEqual(readSites(csv('name,website\nBob\'s "best" shop,a.co.nz\n')).sites, ['https://a.co.nz/']); // a stray quote inside a field is fine
+  assert.throws(() => readSites(csv('website\na.co.nz\n"b.co.nz" x\n')), /not a readable CSV \(near line 3\)/);
+});
+
+test('writeFileAtomic creates files readable by their owner only, and keeps an existing mode (S4)', () => {
+  const f = path.join(tmp(), 'x.csv');
+  writeFileAtomic(f, 'a');
+  assert.equal(fs.statSync(f).mode & 0o777, 0o600);
+  fs.chmodSync(f, 0o644);
+  writeFileAtomic(f, 'b');
+  assert.equal(fs.statSync(f).mode & 0o777, 0o644);
+  assert.equal(fs.readFileSync(f, 'utf8'), 'b');
+});
+
+test('processFile --summary-only: credited rows, shared file, input names and failure details', async () => {
+  const dir = tmp();
+  const input = path.join(dir, 'list.csv');
+  fs.writeFileSync(input, 'name,website\nAlpha Motors,a.com.au\nBeta Motors,b.com.au\nGamma Motors,c.com.au\nDead Motors,dead.com.au\n');
+  const layout = fileLayout('dealers', 'list', path.join(dir, 'emails'));
+  fs.mkdirSync(layout.cacheDir, { recursive: true });
+  const dealer = (h: string): SiteResult => site(`https://${h}/`, { business: 'Home', emails: [
+    { email: 'complaints@myfordfinance.com.au', name: null, link: `https://${h}/privacy` },
+    { email: `sales@${h}`, name: null, link: `https://${h}/contact` },
+  ] });
+  writeCacheAtomic(cacheFiles(layout.cacheDir, 'list').cache, [
+    dealer('a.com.au'), dealer('b.com.au'), dealer('c.com.au'),
+    site('https://dead.com.au/', { pages: 0, error: 'unreachable', errorDetail: 'dns' }),
+  ]);
+  const opts = { ...DEFAULT_OPTIONS, concurrency: 1, hostConcurrency: 1 };
+  await processFile(input, layout, opts, null, true);
+  const rows = parse(fs.readFileSync(layout.outFile, 'utf8'), { columns: true }) as Record<string, string>[];
+  assert.deepEqual(rows.map((r) => [r.name, r.email]), [['Alpha Motors', 'sales@a.com.au'], ['Beta Motors', 'sales@b.com.au'], ['Gamma Motors', 'sales@c.com.au']]);
+  const shared = parse(fs.readFileSync(layout.sharedFile, 'utf8'), { columns: true }) as Record<string, string>[];
+  assert.deepEqual(shared.map((r) => r.email), ['complaints@myfordfinance.com.au']);
+  const summary = fs.readFileSync(path.join(layout.logDir, 'list.log'), 'utf8');
+  assert.match(summary, /3 unique \(0 person name, 0 department page title, 3 input name, 0 business name\)/);
+  assert.match(summary, /Shared {3}: 1 email\(s\) found on 3\+ sites .* -> shared\/list\.csv \(complaints@myfordfinance\.com\.au 3\)/);
+  assert.match(summary, /Failures : unreachable=1 \(dns=1\)/);
+  assert.match(summary, /dead\.com\.au \[unreachable: dns\]/);
+});
+
+test('--retry-capped needs a higher --max-pages, and picks only rows stopped by the page cap (F4)', () => {
+  assert.throws(() => retryOptions(parseArgs(['--retry-capped'])), /--max-pages/);
+  assert.equal(retryOptions(parseArgs(['--retry-capped', '--max-pages=800'])).capped, true);
+  const emails = [{ email: 'a@b.nz', name: null, link: 'x' }];
+  const capped = site('c', { v: 3, emails, capQueued: 30, resume: { queued: [['https://c/q', 2]], limited: [], attempts: 400, capped: true } });
+  const timed = site('t', { v: 3, emails, budgetQueued: 30, resume: { queued: [['https://t/q', 2]], limited: [], attempts: 120 } });
+  assert.equal(cappedRetry(capped), true);
+  assert.equal(budgetRetry(capped), false, 'more time would not help a capped site');
+  assert.equal(cappedRetry(timed), false);
+  const done = new Map([['c', capped], ['t', timed]]);
+  assert.deepEqual(Object.fromEntries(planRetries(done, { failed: false, rateLimited: false, budget: false, capped: true }).resume), { c: { budget: false, limited: false, capped: true } });
+  assert.deepEqual([...planRetries(done, { failed: false, rateLimited: false, budget: true }).resume.keys()], ['t']);
+});
+
+test('every command-line flag is documented in --help (F2)', () => {
+  for (const f of [...BOOLEAN_FLAGS, ...INTEGER_FLAGS, ...NUMBER_FLAGS, ...OPTIONAL_NUMBER_FLAGS, ...STRING_FLAGS]) assert.match(USAGE, new RegExp(`--${f}\\b`), f);
+});
+
+test('--check-mx drops only domains DNS says cannot receive mail (F3)', async () => {
+  const err = (code: string) => Object.assign(new Error(code), { code });
+  setMxResolver({
+    resolveMx: async (d) => {
+      if (d === 'acme.co.nz') return [{ exchange: 'mx.acme.co.nz', priority: 10 }];
+      if (d === 'nullmx.nz') return [{ exchange: '.', priority: 0 }];
+      if (d === 'gone.nz') throw err('ENOTFOUND');
+      if (d === 'flaky.nz') throw err('ETIMEOUT');
+      throw err('ENODATA');
+    },
+    resolve4: async (d) => { if (d === 'webonly.nz') return ['93.184.216.34']; throw err('ENODATA'); },
+    resolve6: async () => { throw err('ENODATA'); },
+  });
+  try {
+    const bad = await undeliverable(['a@acme.co.nz', 'b@nullmx.nz', 'c@gone.nz', 'd@flaky.nz', 'e@webonly.nz', 'f@nothing.nz']);
+    assert.deepEqual([...bad].sort(), ['b@nullmx.nz', 'c@gone.nz', 'f@nothing.nz']);
+  } finally {
+    setMxResolver(null);
+  }
+});
+
+test('--dry-run describes each file without writing anything (F2)', () => {
+  const dir = tmp();
+  const input = path.join(dir, 'websites', 'clinics', 'list.csv');
+  fs.mkdirSync(path.dirname(input), { recursive: true });
+  fs.writeFileSync(input, 'website\na.nz\nb.nz\nc.nz\n');
+  const layout = fileLayout('clinics', 'list', path.join(dir, 'emails'));
+  assert.equal(previewFile(input, layout, null, false), 'clinics/list: would scrape 3 sites');
+  fs.mkdirSync(layout.cacheDir, { recursive: true });
+  const cf = cacheFiles(layout.cacheDir, 'list');
+  writeCacheAtomic(cf.cache, [site('https://a.nz/', { emails: [{ email: 'x@a.nz', name: null, link: 'l' }] }), site('https://b.nz/', { error: 'unreachable' })]);
+  fs.writeFileSync(cf.marker, '1');
+  assert.match(previewFile(input, layout, null, false), /resume an interrupted scrape: 2 of 3 sites cached, 1 to scrape/);
+  assert.match(previewFile(input, layout, { failed: true, rateLimited: false, budget: false }, false), /re-crawl 1 and continue 0 of 3 sites, and scrape 1 not scraped yet/);
+  assert.match(previewFile(input, layout, null, true), /interrupted; would be skipped/);
+  fs.rmSync(cf.marker);
+  fs.mkdirSync(layout.emailsDir, { recursive: true });
+  fs.writeFileSync(layout.outFile, 'name,email,website,link\n');
+  assert.match(previewFile(input, layout, null, false), /would scrape all 3 sites again/);
+  assert.equal(fs.readdirSync(layout.cacheDir).sort().join(), 'list.jsonl', 'nothing written, no lock taken');
+
+  fs.writeFileSync(path.join(layout.cacheDir, 'gone.inprogress'), '1');
+  fs.writeFileSync(path.join(layout.cacheDir, 'list.lock'), '999999999');
+  const stale = staleState([input], path.join(dir, 'emails'));
+  assert.equal(stale.length, 2);
+  assert.match(stale.join('\n'), /gone\.inprogress: an interrupted scrape whose input list is gone/);
+  assert.match(stale.join('\n'), /list\.lock: left by a run that is gone/);
 });

@@ -1,9 +1,43 @@
-export const BOOLEAN_FLAGS = ['force', 'retry-failed', 'retry-rate-limited', 'summary-only', 'quick', 'unique'];
+export const BOOLEAN_FLAGS = ['force', 'retry-failed', 'retry-rate-limited', 'retry-capped', 'summary-only', 'quick', 'unique', 'dry-run', 'check-mx', 'help'];
 export const INTEGER_FLAGS = ['max-pages', 'browser-pages', 'max-depth', 'concurrency', 'page-concurrency', 'host-concurrency'];
 export const NUMBER_FLAGS = ['budget']; // minutes, may be fractional
 export const OPTIONAL_NUMBER_FLAGS = ['retry-budget-queued']; // a flag that may carry minutes: --x, --x=60 or --x 60
-export const RETRY_FLAGS = ['retry-failed', 'retry-rate-limited', 'retry-budget-queued'];
+export const RETRY_FLAGS = ['retry-failed', 'retry-rate-limited', 'retry-budget-queued', 'retry-capped'];
 export const STRING_FLAGS = ['log-level'];
+
+export const USAGE = `Usage: npm run scrape -- [options] [websites/<category>/<list>.csv ...]
+
+With no files, scrapes every list under websites/ that has no output yet (and resumes interrupted ones).
+Named files are always scraped again.
+
+Crawl limits (defaults: deep crawl)
+  --quick                    lighter crawl: 150 pages, 30 browser pages, 10 min per site
+  --max-pages=N              plain-HTTP pages per site (400)
+  --browser-pages=N          headless-browser pages per site (60; 0 turns the browser off)
+  --max-depth=N              click levels from the landing page (0 = unlimited)
+  --budget=MIN               soft time budget per site, in minutes (20)
+  --concurrency=N            sites in parallel (12)
+  --page-concurrency=N       page requests in parallel within one site (3)
+  --host-concurrency=N       requests in parallel to one server, across all sites (3)
+
+Re-running and retrying (they reuse the cache and can be combined)
+  --force                    scrape every list again, even those with an output
+  --retry-failed             crawl again the sites that failed with no emails
+  --retry-rate-limited       fetch the pages servers refused with HTTP 429/503
+  --retry-budget-queued[=MIN]  continue sites that ran out of time, from their saved queue
+  --retry-capped             continue sites that reached --max-pages (give a higher --max-pages)
+
+Outputs without crawling
+  --summary-only             rebuild CSVs and summaries from the cache with the current rules
+  --unique                   each email once per category -> emails/<category>/unique/<category>.csv
+  --check-mx                 drop emails whose domain can't receive mail (DNS lookups only)
+
+Other
+  --dry-run                  show what the command would do; writes nothing under emails/
+  --log-level=LEVEL          file log level: trace, debug, info, warn, error, fatal, silent (info)
+  --help, -h                 this text
+
+See README.md for details.`;
 
 export interface ParsedArgs {
   flags: Set<string>;
@@ -46,6 +80,7 @@ export function parseArgs(argv: string[]): ParsedArgs {
       if (raw === undefined || raw === '' || !Number.isFinite(n) || n < 0 || (integer && !Number.isInteger(n))) {
         throw new Error(`--${name} needs a ${integer ? 'whole number' : 'number'} ≥ 0, got "${raw ?? ''}"`);
       }
+      if (name === 'budget' && n === 0) throw new Error('--budget needs minutes > 0 (0 would stop every site after its homepage)');
       values.set(name, n);
     } else {
       throw new Error(`Unknown option: --${name}`);
@@ -58,6 +93,7 @@ export interface RetryOptions {
   failed: boolean; // sites that failed with no emails: crawled again from the start
   rateLimited: boolean; // pages the server refused with 429/503: fetched again
   budget: boolean; // the queue left when the time budget ran out: continued
+  capped: boolean; // the queue left at the page cap: continued up to a higher --max-pages
   budgetMin?: number; // per-site budget for this run, from --retry-budget-queued=MIN
 }
 
@@ -67,7 +103,10 @@ export function retryOptions({ flags, values }: ParsedArgs): RetryOptions {
   if (budgetMin !== undefined && values.has('budget')) {
     throw new Error('--retry-budget-queued=MIN and --budget=MIN both set the time budget; give it once');
   }
-  return { failed: flags.has('retry-failed'), rateLimited: flags.has('retry-rate-limited'), budget: flags.has('retry-budget-queued'), budgetMin };
+  if (flags.has('retry-capped') && !values.has('max-pages')) {
+    throw new Error('--retry-capped continues sites that stopped at their page cap, so it needs a higher cap: add --max-pages=N (the default is 400)');
+  }
+  return { failed: flags.has('retry-failed'), rateLimited: flags.has('retry-rate-limited'), budget: flags.has('retry-budget-queued'), capped: flags.has('retry-capped'), budgetMin };
 }
 
 /** The raw value of one string flag, read before full validation (so logging can start first). */

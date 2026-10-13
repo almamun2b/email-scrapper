@@ -89,25 +89,32 @@ export function rateLimitedRetry(r: SiteResult): boolean {
 /** --retry-budget-queued: the time budget ran out with pages still queued, or before the browser phase ran. */
 export function budgetRetry(r: SiteResult): boolean {
   if (r.error === 'robots-disallowed') return false;
-  return (r.budgetQueued ?? 0) > 0 || !!r.resume?.queued.length || !!r.resume?.browser;
+  return (r.budgetQueued ?? 0) > 0 || (!!r.resume?.queued.length && !r.resume.capped) || !!r.resume?.browser;
+}
+
+/** --retry-capped: the page cap (--max-pages) was reached with pages still queued (v3 rows only). */
+export function cappedRetry(r: SiteResult): boolean {
+  if (r.error === 'robots-disallowed') return false;
+  return !!r.resume?.capped && r.resume.queued.length > 0;
 }
 
 export interface RetryFlags {
   failed: boolean;
   rateLimited: boolean;
   budget: boolean;
+  capped?: boolean;
 }
 
 export interface RetryPlan {
   recrawl: Set<string>; // crawled again from the start
   resume: Map<string, ResumeParts>; // continued from their saved state (resumeSite)
-  previous: Map<string, SiteResult>; // re-crawled rows with emails: kept if the re-crawl finds fewer
+  previous: Map<string, SiteResult>; // re-crawled rows with emails: kept, plus the new emails a re-crawl finds (mergeResults)
 }
 
 /**
  * Which cached sites a retry run redoes, and how. A failure is crawled again from the start. Rate-limited
  * pages and a queue left by the time budget are continued from the row's saved state; a row without one
- * (scraped before v3, or marked from the logs) is crawled again instead, keeping its result if that finds fewer.
+ * (scraped before v3, or marked from the logs) is crawled again instead; its row is kept and only new emails are added.
  */
 export function planRetries(done: Map<string, SiteResult>, flags: RetryFlags): RetryPlan {
   const plan: RetryPlan = { recrawl: new Set(), resume: new Map(), previous: new Map() };
@@ -116,10 +123,11 @@ export function planRetries(done: Map<string, SiteResult>, flags: RetryFlags): R
       plan.recrawl.add(site);
       continue;
     }
-    const parts: ResumeParts = { budget: flags.budget && budgetRetry(r), limited: flags.rateLimited && rateLimitedRetry(r) };
-    if (!parts.budget && !parts.limited) continue;
+    const parts: ResumeParts = { budget: flags.budget && budgetRetry(r), limited: flags.rateLimited && rateLimitedRetry(r), capped: !!flags.capped && cappedRetry(r) };
+    if (!parts.budget && !parts.limited && !parts.capped) continue;
     const s = r.resume;
-    const saved = (!parts.budget || !!(s?.queued.length || s?.browser)) && (!parts.limited || !!s?.limited.length);
+    // A capped row always has its queue saved, so only the other parts can send a row back to a full re-crawl.
+    const saved = (!parts.budget || !!((s?.queued.length && !s.capped) || s?.browser || (s?.capped && parts.capped))) && (!parts.limited || !!s?.limited.length);
     if (saved) {
       plan.resume.set(site, parts);
     } else {
@@ -130,11 +138,22 @@ export function planRetries(done: Map<string, SiteResult>, flags: RetryFlags): R
   return plan;
 }
 
-/** Replaces the cache file via a temp file and rename, so a crash never leaves it truncated. */
-export function writeCacheAtomic(file: string, results: Iterable<SiteResult>): void {
+/**
+ * Replaces a file via a temp file and rename, so a crash never leaves it truncated. Outputs hold personal data,
+ * so a new file is readable by its owner only (an existing file keeps its mode).
+ */
+export function writeFileAtomic(file: string, text: string): void {
   const tmp = file + '.tmp';
-  fs.writeFileSync(tmp, [...results].map((r) => JSON.stringify(r) + '\n').join(''));
+  let mode = 0o600;
+  try { mode = fs.statSync(file).mode & 0o777; } catch { /* new file */ }
+  fs.writeFileSync(tmp, text, { mode });
+  fs.chmodSync(tmp, mode); // the umask may have narrowed it
   fs.renameSync(tmp, file);
+}
+
+/** Replaces the cache file atomically (see writeFileAtomic). */
+export function writeCacheAtomic(file: string, results: Iterable<SiteResult>): void {
+  writeFileAtomic(file, [...results].map((r) => JSON.stringify(r) + '\n').join(''));
 }
 
 function stamp(d = new Date()): string {
@@ -166,7 +185,7 @@ export class LockedError extends Error {}
 const heldLocks = new Set<string>();
 let exitHookInstalled = false;
 
-function pidAlive(pid: number): boolean {
+export function pidAlive(pid: number): boolean {
   try {
     process.kill(pid, 0);
     return true;

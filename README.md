@@ -104,6 +104,8 @@ websites/dealers/au.ford.csv   ──►   emails/dealers/emails/au.ford.csv
 - Values may be full URLs (`https://www.example.co.nz/`) or bare domains (`example.co.nz`). `https://` is added when missing. The common typo `www./example.com` is repaired. Hosts without a real domain (`www.`, `a..b.com`, an unknown TLD) are counted as invalid rows.
 - Duplicate rows are ignored, including `www.` vs non-`www.` versions. Rows are compared by **domain + path + query string**, so several pages on one domain are kept as separate sites. For example, two dealers hosted on one dealer-group site (`group.com.au/ford-a`, `group.com.au/ford-b`) are crawled separately.
 - A URL with a path (`https://example.org/clinics/auckland`) focuses the crawl on that section of the site. See [Section-focused crawling](#section-focused-crawling).
+- A **name column** (header `name`, or `business name`, `company name`, `practice name`, `church name`, …) is used as the row's name when no person or department name is found, before the name scraped from the site. It is read from the input every time, never cached, so fixing a name in the input fixes the output on the next `--summary-only`.
+- Files saved by Excel as "Unicode text" (UTF-16, tab-separated) are read too. A stray quote inside a field is tolerated; a file that still can't be parsed is skipped with the line number, and the run carries on with the other files.
 
 ## Output format
 
@@ -111,7 +113,7 @@ websites/dealers/au.ford.csv   ──►   emails/dealers/emails/au.ford.csv
 
 | Column | Meaning |
 |---|---|
-| `name` | Best name for the email, in this order: **person name** if one is clearly tied to the email, then the **department page title** (e.g. `Audiology — Auckland`), then the **business name** of the site |
+| `name` | Best name for the email, in this order: **person name** if one is clearly tied to the email, then the **department page title** (e.g. `Audiology — Auckland`), then the **input's own name** for the site (when the input has a name column), then the **business name** scraped from the site |
 | `email` | The email address, lower-cased |
 | `website` | The website URL from the input CSV |
 | `link` | The page the email was found on |
@@ -125,7 +127,8 @@ Lumino The Dentists,henderson@lumino.co.nz,https://lumino.co.nz/,https://lumino.
 ```
 
 Rules:
-- **One row per email per file.** If the same email appears on several sites, it is credited to the first site in input order.
+- **One row per email per file.** If the same email appears on several sites, it is credited to the site that owns it: the first site whose domain is the email's domain (`sales@bydcastlehill.com.au` goes to `bydcastlehill.com.au`, even when a dealer-group page earlier in the list shows it too). Otherwise it goes to the first site where it was a real link or text rather than only in a script, and otherwise to the first site in input order.
+- **Shared emails go to their own file.** An email found on 3 or more sites, none of which owns its domain, is boilerplate: a regulator on privacy pages (`enquiries@oaic.gov.au`), a manufacturer's head office (`foacust1@ford.com`), a finance partner. Those rows go to `emails/<category>/shared/<name>.csv` (same columns, credited the same way) instead of the main CSV, and the summary's `Shared` line counts them.
 - Rows follow the input order of the websites.
 - If an email appears on several pages, `link` is the first page it was seen on. A later page wins only if it ties the email to a person name.
 - A `name` that starts with `=`, `+`, `-` or `@` is prefixed with `'`, so a hostile page title can't become a live formula in Excel or Google Sheets.
@@ -151,7 +154,11 @@ With no arguments, each category folder in `emails/` gets its own combined list,
 | `npm run scrape -- --retry-failed` | Crawl again, from the start, only the sites that failed with no emails (unreachable, timeout, …). Everything else comes from the cache. Rebuilds the CSVs and logs. See [Retrying and continuing sites](#retrying-and-continuing-sites) |
 | `npm run scrape -- --retry-rate-limited` | Fetch again only the pages a server refused with HTTP 429/503 (and the new links on them), and merge what they give into each site's result |
 | `npm run scrape -- --retry-budget-queued[=MIN]` | Continue the sites that ran out of time budget from where they stopped: only the pages still queued are fetched, with a budget of `MIN` minutes per site (default: `--budget`) |
+| `npm run scrape -- --retry-capped --max-pages=N` | Continue the sites that reached the page cap from their saved queue, up to the higher cap `N` (the summary's `Capped` line) |
 | `npm run scrape -- --summary-only` | Scrape nothing. Rebuild the CSVs and summary logs from the cache, applying the current email and name rules. Skips (and leaves untouched) a file with no cache or an interrupted scrape |
+| `npm run scrape -- --summary-only --check-mx` | Same, and drop emails whose domain can't receive mail (no MX or address record in DNS). `--check-mx` works with any scrape too |
+| `npm run scrape -- --dry-run` | Show what a command would do with each file (scrape, resume, retry, skip), plus leftover markers and locks. Scrapes and writes nothing under `emails/` |
+| `npm run scrape -- --help` | List every option |
 | `npm run scrape -- --unique` | Scrape nothing. Combine each category's outputs into `emails/<category>/unique/<category>.csv` with each email once. See [Unique emails across files](#unique-emails-across-files) |
 | `npm run scrape -- --unique websites/dealers/au.*.csv` | Same, for only the named files: writes `emails/dealers/unique/au.csv` |
 | `npm run scrape -- --quick` | Lighter, faster crawl (150 pages, 10 min per site). See [Crawl options](#crawl-options-depth-and-limits) |
@@ -207,7 +214,7 @@ There is **no depth limit by default**. The crawler follows links as deep as the
 
 | Option | What it controls | Default (deep) | With `--quick` |
 |---|---|---|---|
-| `--max-pages=N` | Max page requests per site with plain HTTP (phase 1) | 400 | 150 |
+| `--max-pages=N` | Max page requests per site with plain HTTP (phase 1). When a site reaches it with pages still queued, the queue is saved, so `--retry-capped` can go deeper later | 400 | 150 |
 | `--browser-pages=N` | Max page requests per site in the headless-browser fallback (phase 2). `0` turns the fallback off | 60 | 30 |
 | `--max-depth=N` | Max click level to follow from the start page. `0` = unlimited | 0 (unlimited) | 0 (unlimited) |
 | `--budget=MIN` | Soft time budget per site in minutes. When it runs out, the site stops, keeps what it found and saves the pages it still had queued, so `--retry-budget-queued` can continue it later. A hard stop happens 4 minutes later, and it also keeps (and saves) what was found | 20 | 10 |
@@ -317,13 +324,14 @@ After a run finishes:
 
 ## Retrying and continuing sites
 
-A finished run can leave three kinds of unfinished work. Each has its own flag, and they can be combined in one run. Only the selected sites are crawled; every other site comes from the cache, and the CSV and summary are rebuilt from all of them.
+A finished run can leave four kinds of unfinished work. Each has its own flag, and they can be combined in one run. Only the selected sites are crawled; every other site comes from the cache, and the CSV and summary are rebuilt from all of them.
 
 | Flag | Which sites | What it does |
 |---|---|---|
 | `--retry-failed` | Failed with no emails (`unreachable`, `timeout`, `browser-error`, `internal-error`) | Crawls them again from the start |
 | `--retry-rate-limited` | A server refused some pages with HTTP 429/503 even after one retry (the summary's `Limited` line) | Fetches only those pages, plus any new links found on them. Pages already fetched are not fetched again |
 | `--retry-budget-queued[=MIN]` | Ran out of time budget with pages still queued (the summary's `Out of time` line), or before the headless-browser phase could run | Continues the saved queue with `MIN` minutes per site, then runs the browser phase if it is still owed. Pages already fetched are not fetched again |
+| `--retry-capped --max-pages=N` | Reached the page cap (`--max-pages`) with pages still queued (the summary's `Capped` line) | Continues the saved queue up to the new cap `N`, which must be higher than the one they stopped at. Pages already fetched are not fetched again |
 
 ```bash
 npm run scrape -- websites/churches/au.churches.csv --retry-budget-queued=60
@@ -337,9 +345,10 @@ npm run scrape -- websites/gifts/*.csv --retry-failed --retry-rate-limited --ret
 - **The budget.** `--retry-budget-queued=60` is the same as `--retry-budget-queued --budget=60`; give it one way, not both. Sites with a `Crawl-delay` need it: at 10 seconds per page, 20 minutes is only about 120 pages.
 - **The page cap still counts.** A continued site can use the rest of its `--max-pages` (400 by default). If the first crawl already used it up, the queue is kept and the log says so; raise `--max-pages` to continue.
 - **Up to 2000 queued pages are saved per site,** best first. Pages past that can still be found again through links.
-- **Without a file argument** the retries go through every list under `websites/`, including those that already have an output.
+- **Without a file argument** the retries go through every list under `websites/` that has an output. A list never scraped is skipped (there is nothing to retry); scrape it normally first.
+- **A re-crawl never loses emails.** A site crawled again from the start (by `--retry-failed`, or a row without saved state) keeps its earlier row as it was, and only emails the re-crawl found that the row didn't have are added.
 
-**Sites scraped before this feature** have no saved queue, so `--retry-budget-queued` can't see them. `scripts/mark-budget-from-logs.ts` finds them in `logs/scraper-*.log` (the `time budget used up` lines) and marks their cache rows. A marked site is crawled again from the start with the new budget, and keeps its earlier result if that finds fewer emails. The same goes for rate-limited sites from older runs, which only have a count of skipped pages.
+**Sites scraped before this feature** have no saved queue, so `--retry-budget-queued` can't see them. `scripts/mark-budget-from-logs.ts` finds them in `logs/scraper-*.log` (the `time budget used up` lines) and marks their cache rows. A marked site is crawled again from the start with the new budget; its earlier row is kept and only new emails are added, and the mark is replaced by the re-crawl's own saved state. The same goes for rate-limited sites from older runs, which only have a count of skipped pages.
 
 ```bash
 npx tsx scripts/mark-budget-from-logs.ts
@@ -399,13 +408,15 @@ After each CSV is processed, a summary is printed and **appended** to `emails/<c
 ```
 [2026-09-29 13:49:30] nz_veterinarians_all.csv  (scrape, took 38m 12s)
   Websites : 72 total | 53 with emails | 14 no emails found | 5 failed
-  Emails   : 241 unique (51 person name, 0 department page title, 190 business name)
+  Emails   : 241 unique (51 person name, 0 department page title, 120 input name, 70 business name)
   Crawl    : 3919 pages fetched | headless browser used on 17 sites
-  Failures : unreachable=5
+  Shared   : 2 email(s) found on 3+ sites that don't own them -> shared/nz_veterinarians_all.csv (privacy@vetpartners.co.nz 9, enquiries@privacy.org.nz 4)
+  Failures : unreachable=5 (dns=3, http-403=2)
   Out of time: 2 site(s) ran out of time budget with 317 page(s) still queued: vetent.co.nz (176), carevets.co.nz (141); continue them with --retry-budget-queued=MIN
+  Capped   : 1 site(s) reached the page cap with 220 page(s) still queued: vetent.co.nz (220); continue them with --retry-capped --max-pages=N (a higher cap)
   Top sites: vetent.co.nz (25), myfarmfirst.co.nz (24), carevets.co.nz (23), ...
   Failed sites:
-    - clivevets.co.nz [unreachable]
+    - clivevets.co.nz [unreachable: dns]
   No emails found on:
     - anexa.co.nz
 ```
@@ -414,8 +425,9 @@ Failure reasons:
 
 | Reason | Meaning |
 |---|---|
-| `unreachable` | The site didn't respond (DNS failure, connection refused, TLS error, or every start URL failed) |
-| `robots-disallowed` | The site's `robots.txt` (on the host reached after redirects) forbids crawling it, or answers with a server error (5xx), which the robots.txt standard treats as "keep out" |
+| `unreachable` | The site didn't respond on any start URL. The summary says why, from the first start URL: `dns` (the domain doesn't resolve; the browser isn't tried either), `refused`, `tls`, `timeout`, `reset`, `private` (it resolves to a private address), `redirects`, `http-<status>` (e.g. `http-403`, often a bot block), or `not-html` |
+| `robots-disallowed` | The site's `robots.txt` (on the host reached after redirects) forbids crawling it |
+| `robots-unavailable` | The site's `robots.txt` answers with a server error (5xx), which the robots.txt standard treats as "keep out". This may be temporary, so `--retry-failed` tries these again |
 | `timeout` | The site exceeded the hard safety limit (the `--budget` plus 4 minutes; 24 minutes by default). It was stopped, and whatever it found by then is kept |
 | `browser-error` | The headless browser crashed or couldn't start on this site. Plain-HTTP results, if any, are kept. The details are in `logs/error-<date>.log` |
 | `internal-error` | The scraper itself crashed on this site. The stack trace is in `logs/error-<date>.log` |
@@ -424,6 +436,12 @@ Failure reasons:
 "No emails found" means the site was crawled successfully but publishes no email address. Often it only has a contact form.
 
 A `Limited : N page(s) skipped on M site(s) …` line means those servers answered HTTP 429 (Too Many Requests) or 503 (Service Unavailable) even after one retry, so those pages were skipped. The busiest servers are listed. A few is normal. The scraper already slows down for a server that answers 429/503 (see [Politeness and robots.txt](#politeness-and-robotstxt)), so `--retry-rate-limited` is usually enough: it fetches just the skipped pages again. If the line stays large, run it with fewer parallel requests (`--host-concurrency=1`, or `--concurrency=6`). The per-site progress line also shows `N pages rate-limited`.
+
+A `Shared : N email(s) …` line counts the emails moved to `shared/<name>.csv` (see [Output format](#output-format)), with the most widespread ones.
+
+A `Capped : N site(s) …` line means those sites reached `--max-pages` with pages still queued. Contact-like pages are fetched first, so what's left is mostly deep pages; `--retry-capped --max-pages=N` continues them if you want more.
+
+An `MX check : …` line (with `--check-mx`) lists the emails dropped because their domain can't receive mail.
 
 An `Out of time: N site(s) …` line means those sites used up their time budget with pages still queued (`browser` instead of a count means the headless-browser phase didn't get to run). The most-queued sites are listed. `--retry-budget-queued=MIN` continues them where they stopped; see [Retrying and continuing sites](#retrying-and-continuing-sites). The per-site progress line also shows `N queued at time limit`, and a continued site shows `(resumed: +X emails, +Y pages)`.
 
@@ -469,7 +487,9 @@ jq -c 'select(.site == "https://example.co.nz/")' logs/scraper-2026-10-03.log
 
 ## Cache and resuming
 
-Each finished site is appended as one JSON line to `emails/<category>/.cache/<name>.jsonl`. The line holds the site URL, final URL after redirects, business name, emails with names, page titles, links and where each email was found (`source`), pages fetched, whether the browser was used, and any error. A site that ran out of time or had pages rate-limited also saves what is left (`budgetQueued`, and `resume` with the queued and refused pages and the pages already seen), which the `--retry-*` flags continue from.
+Each finished site is appended as one JSON line to `emails/<category>/.cache/<name>.jsonl`. The line holds the site URL, final URL after redirects, business name, emails with names, page titles, links and where each email was found (`source`), pages fetched, whether the browser was used, and any error with its detail (`errorDetail`). A site that ran out of time, reached the page cap or had pages rate-limited also saves what is left (`budgetQueued` or `capQueued`, and `resume` with the queued and refused pages and the pages already seen), which the `--retry-*` flags continue from.
+
+Output and cache files hold personal data, so new ones are created readable by their owner only (folders `0700`, files `0600`).
 
 Files in `emails/<category>/.cache/` for each input `<name>`:
 
@@ -493,7 +513,8 @@ Files in `emails/<category>/.cache/` for each input `<name>`:
 - Uses a priority queue. Pages with paths like `contact`, `about`, `team`, `staff`, `locations`, `clinic`, … are fetched first, then the rest breadth-first.
 - Seeds the queue from `sitemap.xml` (and sitemaps listed in `robots.txt`).
 - Skips non-HTML files (PDFs, images, documents, media), `wp-content/uploads`, login/cart/calendar pages, and crawl traps (URLs with many query parameters, very long URLs, very deep paths). Non-HTML responses are recognised by their `Content-Type` and never downloaded.
-- Follows redirects itself. A page that redirects to another site, or into a path `robots.txt` disallows, is skipped. Gzipped sitemaps are supported.
+- Follows redirects itself, checking each hop against the `robots.txt` of its own host before requesting it. A page that redirects to another site, or into a disallowed path, is skipped. Gzipped sitemaps are supported, and sitemap URLs with `&amp;` are decoded.
+- Follows `<frame>` and `<iframe>` sources on the same site, and `<meta http-equiv="refresh">` redirects, so older framed sites are crawled too.
 - Decodes pages in their declared charset (header or `<meta charset>`), so names on older `windows-1252` sites come out right.
 - Listing detail pages (car stock, offers, news and blog posts) are fetched last, and stock/product sitemaps are read after page sitemaps.
 - Limits (defaults, see [Crawl options](#crawl-options-depth-and-limits)): **400 pages per site**, unlimited depth, 3 parallel requests per site, 15 s per request, 5 MB per page, and a 20-minute budget per site (partial results are kept, and the pages still queued are saved for `--retry-budget-queued`).
@@ -505,7 +526,7 @@ Chromium (via Playwright) re-crawls up to **60 pages** (`--browser-pages`), star
 - the homepage looks JavaScript-rendered (very little text without scripts), or
 - the HTTP crawl found no emails.
 
-Images, fonts and media are blocked to keep it fast. If Chromium crashes, the next site starts a new one.
+Images, fonts and media are blocked to keep it fast. Same-site frames are read along with the page. If Chromium crashes, the next page starts a new one. A domain that doesn't resolve at all isn't tried in the browser.
 
 **Headless browser sandbox.** Chromium runs with its sandbox on, because it executes JavaScript from thousands of unknown sites. On Linux that needs unprivileged user namespaces. If the browser fails to start with a sandbox or namespace error (some hardened Ubuntu setups), either allow them for Playwright's Chromium (on Ubuntu 23.10+ that means an AppArmor profile for the Chromium binary), run the scraper in a container, or, accepting the risk, run with `SCRAPER_NO_SANDBOX=1`.
 
@@ -517,13 +538,14 @@ Images, fonts and media are blocked to keep it fast. If Chromium crashes, the ne
 - Obfuscated forms: `name [at] domain [dot] co [dot] nz`, `name(at)domain.com`, and ROT13-scrambled addresses (`vasb@rknzcyr.pbz.nh` → `info@example.com.au`)
 - `data-email` / `data-mail` attributes and schema.org / JSON-LD `email` fields
 
-Junk is filtered out: image names like `logo@2x.png`, placeholders (`you@example.com`, `email@domain.com`), tracking or service addresses (Sentry, Wix), hash-like local parts, and domains that aren't under a real public suffix (checked against the Public Suffix List with `tldts`, so `.travel` or `.auto` pass and `.ay` doesn't).
+Junk is filtered out: image names like `logo@2x.png`, placeholders (`you@example.com`, `your@email.com`, `jane.smith@test.com.au`, `you@company.com.au`), platform and service addresses (Sentry, Wix, Squarespace, Podium form relays, domain-parking pages), hash-like local parts, local parts with `..` or a dot at either end, and domains that aren't under a real public suffix (checked against the Public Suffix List with `tldts`, so `.travel` or `.auto` pass and `.ay` doesn't). Text glued on after an address (`info@acme.co.nzPhone`) is cut off at the capital letter.
 
 ### 4. Pick a name
 
 1. **Person name:** from a schema.org `Person`, from `mailto:` link text, or from a nearby heading in the same "card". It must match the email by whole words: a name word equals a part of the local part, or the local part is a usual form like `jsmith`, `janes` or `smithj` for `Jane Smith`, or the name has a title such as `Dr`. Names made only of department words (`Customer Care`) never count. As a last resort a name comes from the local part itself (`mary.jones@` → `Mary Jones`), but only when its first part is a known given name (`src/data/given-names.txt`) and no part is a department word. So `used.cars@` or `customer.relations@` get the business name instead. When one first part appears with five or more different second parts on one site (`bec.brisbane@`, `bec.cairns@`, …), those are branch mailboxes, not people. Generic mailboxes (`info@`, `reception@`, `admin@`, …) never get a person name.
-2. **Department page title:** the `<h1>` of a sub-page, used only in [section-focused crawls](#section-focused-crawling).
-3. **Business name:** from JSON-LD `Organization`/`LocalBusiness`, then `og:site_name`, then the cleaned `<title>`, then the domain.
+2. **Department page title:** the `<h1>` of a sub-page, used only in [section-focused crawls](#section-focused-crawling). Generic titles such as "Contact Us" or "About" don't count.
+3. **Input name:** the input CSV's own name for the site, when it has a name column.
+4. **Business name:** from JSON-LD `Organization`/`LocalBusiness`, then `og:site_name`, then the cleaned `<title>`, then the domain. "Home", "Welcome" and similar are skipped, "Welcome to " is dropped from the front, and an address after a comma is cut off.
 
 ### Section-focused crawling
 
@@ -533,12 +555,12 @@ Pages under that path are fetched first, sitemap seeds are limited to that path,
 
 ### Politeness and robots.txt
 
-- **`robots.txt` is respected**, both on the original domain and on the host reached after a redirect, and in the browser fallback. If the landing page is disallowed, the site is reported as `robots-disallowed` and nothing is extracted. A `robots.txt` that answers with a server error (5xx, after one retry) counts as "disallow everything".
-- **`Crawl-delay` is honoured** (capped at 10 seconds), as a minimum gap between requests to that server.
-- At most **3 requests at a time to any one server** across all sites being crawled. This matters when many input domains redirect to the same server.
+- **`robots.txt` is respected** for every page by the rules of that page's own host and protocol: the original domain, the host reached after a redirect, and the site's `www.`/bare-domain and `http:`/`https:` variants, each with its own `robots.txt`. Every redirect hop is checked before it is requested, and the browser fallback follows the same rules. If the landing page is disallowed, the site is reported as `robots-disallowed` and nothing is extracted. A `robots.txt` that answers with a server error (5xx, after one retry) counts as "disallow everything" and is reported as `robots-unavailable`.
+- **`Crawl-delay` is honoured** (capped at 10 seconds), as a minimum gap between requests to that server, by plain HTTP and the headless browser alike.
+- At most **3 requests at a time to any one server** across all sites being crawled, in both phases. This matters when many input domains redirect to the same server.
 - HTTP 429/503 responses and transient network errors are retried once, after the server's `Retry-After` (1–30 s) or 3 seconds. A page still refused is skipped and counted (see `Limited` in [Summary logs](#summary-logs)).
 - **A server that rate-limits is slowed down automatically.** Each 429/503 doubles the gap between requests to that server (1 s, 2 s, 4 s … up to 10 s), for every site hosted there, and each normal answer halves it again.
-- **Only public addresses are fetched.** Redirects (and, in the browser, any request) to localhost, private networks or cloud metadata addresses are refused.
+- **Only public addresses are fetched.** Redirects (and, in the browser, any request, including popups and WebSockets) to localhost, private networks or cloud metadata addresses are refused. Plain-HTTP connections go to exactly the addresses that were checked, so a host can't answer differently on a second DNS lookup. Service workers are blocked in the browser.
 
 ## Tuning
 
@@ -569,10 +591,11 @@ npx tsx scripts/given-names-report.ts 2
 ## Limitations
 
 - Emails that appear only as images, or behind contact forms, logins or CAPTCHAs, can't be extracted.
-- Very large sites are capped at 400 pages (`--max-pages`), so emails on deep pages can be missed. Contact-like pages are fetched first and listing pages last to reduce this.
+- Very large sites are capped at 400 pages (`--max-pages`), so emails on deep pages can be missed. Contact-like pages are fetched first and listing pages last to reduce this, and `--retry-capped` can continue them later.
+- The browser follows redirects inside Chromium, so a redirect hop there is checked against `robots.txt` only after it loads (its page is then discarded).
 - Sites whose `robots.txt` forbids generic crawlers are skipped by design.
 - Name detection is heuristic. When it isn't confident, it falls back to the business name rather than guessing. People whose first name isn't in the given-name list only get a person name when the page itself ties the name to the email.
-- Aggregator and government sites often list emails belonging to other organisations. Those rows are credited to the site they were found on.
+- Aggregator and government sites often list emails belonging to other organisations. Those rows are credited to the site they were found on, unless another input site owns the email's domain, or the email is on 3+ sites and goes to `shared/`. A dealer group's email shown on several dealer sites in the list goes to `shared/` too when none of those sites is on the group's domain.
 
 ## Responsible use
 
@@ -582,25 +605,28 @@ These are publicly published business contact details. If you use them for marke
 
 ```
 src/
-  index.ts      CLI entry: per-file orchestration, hard timeouts, CSV output, summary logs
-  cli.ts        Command-line parsing and validation
+  index.ts      CLI entry: argument handling, file selection, --dry-run
+  run.ts        Per-file run: hard timeouts, retries, CSV and shared outputs, summary logs, --unique
+  cli.ts        Command-line parsing, validation and --help text
   input.ts      Reading the website column of an input CSV
   cache.ts      Cache file, resume marker, rotation and per-file lock
-  output.ts     CSV rows, formula-safe cells, re-checking cached results
+  output.ts     CSV rows (crediting each email to its site, shared emails), formula-safe cells, re-checking cached results
+  mx.ts         --check-mx: whether an email's domain can receive mail
+  abort.ts      Waits that give up when a site's time is up
   logger.ts     pino logger: console + logs/*.log JSON files, per-site context, crash/signal handlers
   crawler.ts    Per-site crawl: page queue, HTTP phase, headless-browser phase
   http.ts       HTTP GET: redirects, per-server limits, Crawl-delay, retries, charset decoding
   browser.ts    Shared sandboxed Chromium and the browser page fetcher
   robots.ts     robots.txt loading and checks
   sitemap.ts    Sitemap seeding (including .xml.gz)
-  netguard.ts   Refuses private, loopback and metadata addresses
+  netguard.ts   Refuses private, loopback and metadata addresses; the DNS lookup HTTP connections use
   extract.ts    Email extraction, junk filtering, person/business name detection
   urls.ts       URL normalisation, crawlability rules, link priority, section detection
   data/         given-names.txt
 test/           node:test suites and a local test server (npm test)
 scripts/        recheck-cache.ts, given-names-report.ts, mark-budget-from-logs.ts
 websites/       Input CSVs, in category folders: websites/<category>/*.csv (git-ignored)
-emails/         One folder per category, each with emails/ (the output CSVs), logs/, .cache/ and unique/ (git-ignored)
+emails/         One folder per category, each with emails/ (the output CSVs), shared/, logs/, .cache/ and unique/ (git-ignored)
 logs/           Diagnostic JSON logs: scraper-<date>.log, error-<date>.log (git-ignored)
 ```
 
