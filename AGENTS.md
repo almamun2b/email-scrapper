@@ -16,8 +16,13 @@ Standard procedure:
    Plain `npm run scrape` processes every input file that has no output yet.
 3. Watch progress in the log. Each site prints `[n/N] host — X emails, Y pages …`. The run for a file ends with a `=>` line and the summary block.
 4. If the run says a file is "in use by another run", another scrape holds `emails/<category>/.cache/<file>.lock`. Don't delete the lock; find and wait for that PID.
-5. Report per-file totals from the summary: websites with emails, websites with no emails, failed websites grouped by reason (`browser-error` means Chromium crashed on that site), unique emails, and name breakdown. A large `Limited` line means servers were rate-limiting: offer `--retry-failed`, which redoes sites with rate-limited pages too (with automatic per-server slow-down) and keeps the earlier result if it finds fewer emails. If it stays large, re-scrape the file with `--host-concurrency=2` or `--concurrency=6`. Mention noteworthy failures. Check `logs/error-<date>.log` (JSON lines, `npx pino-pretty < file` to read) and report any errors from the run (match its `runId`). For a site that failed for unclear reasons, re-run it alone with `--log-level=debug`.
-6. If many sites fail with transient errors, offer `npm run scrape -- --retry-failed`. It re-crawls only sites that failed with no emails or had rate-limited pages, reusing the existing cache, and keeps everything else.
+5. Report per-file totals from the summary: websites with emails, websites with no emails, failed websites grouped by reason (`browser-error` means Chromium crashed on that site), unique emails, and name breakdown. Mention noteworthy failures. Check `logs/error-<date>.log` (JSON lines, `npx pino-pretty < file` to read) and report any errors from the run (match its `runId`). For a site that failed for unclear reasons, re-run it alone with `--log-level=debug`.
+6. Offer the retry that matches what the summary shows. They are separate flags, can be combined, reuse the existing cache and keep everything else:
+   - `Failures` (many `unreachable`/`timeout`, often transient): `--retry-failed` crawls those sites again from the start.
+   - `Limited` (servers answered 429/503): `--retry-rate-limited` fetches only the refused pages (and new links on them), with the automatic per-server slow-down. If it stays large, add `--host-concurrency=1` or `--concurrency=6`.
+   - `Out of time` (sites ran out of budget with pages queued): `--retry-budget-queued=MIN` continues them from the saved queue without refetching anything. Suggest a budget that fits: sites with `Crawl-delay: 10` get only about 6 pages a minute.
+
+   Sites from runs before this feature have no saved queue. `npx tsx scripts/mark-budget-from-logs.ts` shows which ones the logs say ran out of time; with `--write` (ask the owner first, and only when no run is working on those files) it marks them so `--retry-budget-queued` re-crawls them.
 
 ## Commands
 
@@ -30,7 +35,10 @@ Standard procedure:
 | Scrape new input files | `npm run scrape` |
 | Scrape specific files (always re-scrapes) | `npm run scrape -- websites/dealers/a.csv` |
 | Re-scrape everything | `npm run scrape -- --force` |
-| Re-scrape only failed sites | `npm run scrape -- --retry-failed` |
+| Re-scrape only failed sites (no emails) | `npm run scrape -- --retry-failed` |
+| Fetch the pages servers refused with 429/503 | `npm run scrape -- --retry-rate-limited` |
+| Continue sites that ran out of time budget | `npm run scrape -- --retry-budget-queued=60` |
+| Mark sites that ran out of time before the queue was saved (dry run; `--write` to apply) | `npx tsx scripts/mark-budget-from-logs.ts` |
 | Rebuild CSVs and logs from cache with the current rules, no network | `npm run scrape -- --summary-only` |
 | One list per category with each email once, no network (`emails/<category>/unique/<category>.csv`) | `npm run scrape -- --unique` |
 | Same for only some files (`emails/dealers/unique/au.csv`) | `npm run scrape -- --unique websites/dealers/au.*.csv` |
@@ -73,11 +81,11 @@ For an end-to-end check, write a 2–4 row sample CSV outside `websites/` and ru
 - To stop a run, `kill` the PID printed in its first log line (`Run <id> started (pid N)`). Killing the `npm` PID does not reach the scraper and leaves it running.
 - **Never** wait with `pgrep -f` or kill with `pkill -f` using a pattern that also appears in your own shell command. It matches itself, so the wait never ends or the kill takes out your own shell. This has happened here before.
 - Two runs can't work on the same file: the second one skips it (`<file>.lock` holds the first run's PID). Never delete a lock by hand while that PID is alive.
-- If a run is interrupted, re-running the same command (or a plain `npm run scrape`) resumes from the cache, also for interrupted `--force` re-scrapes (`<file>.inprogress` marks them). Don't delete the partial cache or the marker.
+- If a run is interrupted, re-running the same command (or a plain `npm run scrape`) resumes from the cache, also for interrupted `--force` re-scrapes (`<file>.inprogress` marks them). Don't delete the partial cache or the marker. An interrupted `--retry-*` run continues when the same command is run again.
 
 ## Code conventions
 
 - ESM TypeScript run directly by `tsx`. There is no build output. Relative imports use the `.js` extension (`from './urls.js'`).
 - The heuristics are tuned against real NZ healthcare and AU dealer/tourism sites. When changing `extract.ts` filters or name rules, run `scripts/recheck-cache.ts` and re-check a few known sites, looking for regressions: false person names, junk emails, lost emails. Keep regexes linear (anchor on literals, bound repetitions); a quadratic one can freeze the whole run.
-- The CSV and the summary are always derived from `SiteResult` objects, whether fresh or cached, after `recheckSite()`. New fields must be optional, because old cache lines lack them.
+- The CSV and the summary are always derived from `SiteResult` objects, whether fresh or cached, after `recheckSite()`. New fields must be optional, because old cache lines lack them (`budgetQueued` and `resume` only exist from cache v3).
 - Keep comments sparse and explain *why*, matching the existing code.

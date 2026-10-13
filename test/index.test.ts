@@ -3,8 +3,8 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { acquireLock, beginScrape, cacheFiles, endScrape, ensureTrailingNewline, isRetryable, loadCache, LockedError, writeCacheAtomic } from '../src/cache.js';
-import { parseArgs, rawFlag } from '../src/cli.js';
+import { acquireLock, beginScrape, budgetRetry, cacheFiles, endScrape, ensureTrailingNewline, failedRetry, loadCache, LockedError, planRetries, rateLimitedRetry, writeCacheAtomic } from '../src/cache.js';
+import { parseArgs, rawFlag, retryOptions } from '../src/cli.js';
 import type { SiteResult } from '../src/crawler.js';
 import { readSites } from '../src/input.js';
 import { buildRows, safeCell, uniqueLabel, uniqueRows } from '../src/output.js';
@@ -34,6 +34,28 @@ test('parseArgs rejects values on boolean flags, fractions on counts, unknown fl
   assert.throws(() => parseArgs(['--max-pages']), /whole number/);
   assert.throws(() => parseArgs(['--budget=-1']), /number/);
   assert.throws(() => parseArgs(['--frobnicate']), /Unknown option/);
+});
+
+test('--retry-budget-queued takes minutes as --x=N, --x N, or none; a file after it stays a file', () => {
+  const alone = parseArgs(['--retry-budget-queued', 'websites/a.csv']);
+  assert.ok(alone.flags.has('retry-budget-queued'));
+  assert.equal(alone.values.get('retry-budget-queued'), undefined);
+  assert.deepEqual(alone.files, ['websites/a.csv']);
+  assert.equal(parseArgs(['--retry-budget-queued=60']).values.get('retry-budget-queued'), 60);
+  const spaced = parseArgs(['--retry-budget-queued', '7.5', 'a.csv']);
+  assert.equal(spaced.values.get('retry-budget-queued'), 7.5);
+  assert.deepEqual(spaced.files, ['a.csv']);
+  assert.throws(() => parseArgs(['--retry-budget-queued=0']), /minutes > 0/);
+  assert.throws(() => parseArgs(['--retry-budget-queued=abc']), /minutes > 0/);
+  assert.ok(parseArgs(['--retry-rate-limited']).flags.has('retry-rate-limited'));
+  assert.throws(() => parseArgs(['--retry-rate-limited=1']), /takes no value/);
+});
+
+test('retryOptions: the three retries are independent, and the budget is given once', () => {
+  assert.deepEqual(retryOptions(parseArgs(['--retry-failed', '--retry-rate-limited'])), { failed: true, rateLimited: true, budget: false, budgetMin: undefined });
+  assert.deepEqual(retryOptions(parseArgs(['--retry-budget-queued=45'])), { failed: false, rateLimited: false, budget: true, budgetMin: 45 });
+  assert.equal(retryOptions(parseArgs(['--retry-budget-queued', '--budget=30'])).budgetMin, undefined);
+  assert.throws(() => retryOptions(parseArgs(['--retry-budget-queued=60', '--budget=30'])), /give it once/);
 });
 
 test('rawFlag reads a flag before validation', () => {
@@ -153,15 +175,46 @@ test('ensureTrailingNewline keeps the next append on its own line', () => {
   for (const l of lines) JSON.parse(l);
 });
 
-test('isRetryable: failures with no emails and rate-limited sites, never robots blocks (M10)', () => {
+test('retry predicates: failures, rate-limited pages and time-budget queues; never robots blocks (M10)', () => {
   const emails = [{ email: 'a@b.nz', name: null, link: 'x' }];
-  assert.equal(isRetryable(site('a', { error: 'unreachable' })), true);
-  assert.equal(isRetryable(site('a', { error: 'robots-disallowed' })), false);
-  assert.equal(isRetryable(site('a', { error: 'timeout', emails })), false);
-  assert.equal(isRetryable(site('a')), false);
-  assert.equal(isRetryable(site('a', { emails, rateLimited: 3 })), true);
-  assert.equal(isRetryable(site('a', { emails })), false);
-  assert.equal(isRetryable(site('a', { error: 'robots-disallowed', rateLimited: 1 })), false);
+  const resume = (extra = {}) => ({ queued: [], limited: [], attempts: 5, ...extra });
+  assert.equal(failedRetry(site('a', { error: 'unreachable' })), true);
+  assert.equal(failedRetry(site('a', { error: 'robots-disallowed' })), false);
+  assert.equal(failedRetry(site('a', { error: 'timeout', emails })), false);
+  assert.equal(failedRetry(site('a', { emails, rateLimited: 3 })), false); // rate limiting is its own retry now
+  assert.equal(rateLimitedRetry(site('a', { emails, rateLimited: 3 })), true); // pre-v3 row: only a count
+  assert.equal(rateLimitedRetry(site('a', { v: 3, emails, rateLimited: 1 })), false); // v3, but no page of its own was skipped
+  assert.equal(rateLimitedRetry(site('a', { v: 3, emails, rateLimited: 1, resume: resume({ limited: [['https://a/x', 2]] }) })), true);
+  assert.equal(rateLimitedRetry(site('a', { error: 'robots-disallowed', rateLimited: 1 })), false);
+  assert.equal(budgetRetry(site('a', { emails, budgetQueued: 40 })), true); // marked from the logs
+  assert.equal(budgetRetry(site('a', { v: 3, resume: resume({ browser: 'no-emails' }) })), true);
+  assert.equal(budgetRetry(site('a', { v: 3, emails })), false);
+  assert.equal(budgetRetry(site('a', { error: 'robots-disallowed', budgetQueued: 3 })), false);
+});
+
+test('planRetries: saved state is continued, rows without it are crawled again keeping the better result', () => {
+  const emails = [{ email: 'a@b.nz', name: null, link: 'x' }];
+  const st = { queued: [['https://n.nz/q', 2]] as [string, number][], limited: [['https://n.nz/l', 2]] as [string, number][], attempts: 9 };
+  const done = new Map<string, SiteResult>([
+    ['f', site('f', { error: 'unreachable' })],
+    ['old', site('old', { emails, budgetQueued: 50, rateLimited: 2 })],
+    ['new', site('new', { v: 3, emails, budgetQueued: 50, rateLimited: 1, resume: st })],
+    ['ok', site('ok', { v: 3, emails })],
+    ['rb', site('rb', { error: 'robots-disallowed', budgetQueued: 1 })],
+  ]);
+  const all = planRetries(done, { failed: true, rateLimited: true, budget: true });
+  assert.deepEqual([...all.recrawl].sort(), ['f', 'old']);
+  assert.deepEqual([...all.previous.keys()], ['old']);
+  assert.deepEqual(Object.fromEntries(all.resume), { new: { budget: true, limited: true } });
+
+  const budgetOnly = planRetries(done, { failed: false, rateLimited: false, budget: true });
+  assert.deepEqual([...budgetOnly.recrawl], ['old']);
+  assert.deepEqual(Object.fromEntries(budgetOnly.resume), { new: { budget: true, limited: false } });
+
+  const limitedOnly = planRetries(done, { failed: false, rateLimited: true, budget: false });
+  assert.deepEqual(Object.fromEntries(limitedOnly.resume), { new: { budget: false, limited: true } });
+  // a v3 row with only rate-limited pages left is not picked by the budget retry
+  assert.equal(planRetries(new Map([['x', site('x', { v: 3, emails, resume: { ...st, queued: [] } })]]), { failed: false, rateLimited: false, budget: true }).resume.size, 0);
 });
 
 test('writeCacheAtomic leaves no temp file', () => {

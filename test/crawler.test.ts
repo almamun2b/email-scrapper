@@ -4,7 +4,7 @@ import fs from 'node:fs';
 import { gzipSync } from 'node:zlib';
 import { chromium } from 'playwright';
 import { page, startServer, type Route } from './helpers/server.js';
-import { closeBrowser, scrapeSite } from '../src/crawler.js';
+import { closeBrowser, resumeSite, scrapeSite, type SiteResult } from '../src/crawler.js';
 import { hostGapMs, httpGet, resetHostPacing, setCrawlDelay } from '../src/http.js';
 
 after(() => closeBrowser());
@@ -142,6 +142,9 @@ test('aborting a scrape returns what it found so far (M5)', async () => {
     assert.equal(r.error, 'timeout');
     assert.ok(emailsOf(r).includes('info@acme.co.nz'));
     assert.ok(r.emails.length < 21);
+    // pages cut off mid-fetch go back into the saved queue: every page is either fetched or still queued
+    assert.equal(r.emails.length - 1 + (r.resume?.queued.length ?? 0), 20);
+    assert.equal(r.budgetQueued, r.resume?.queued.length);
   } finally {
     await s.close();
   }
@@ -213,6 +216,122 @@ test('a server answering 429 is slowed down, then sped up again by normal answer
     assert.equal(hostGapMs('127.0.0.1'), 0);
   } finally {
     resetHostPacing();
+    await s.close();
+  }
+});
+
+// ---------- saved queues and resuming ----------
+
+test('a site that runs out of time saves its queue, and resumeSite fetches only what was left', async () => {
+  const links = Array.from({ length: 8 }, (_, i) => `<a href="/p${i}">p</a>`).join('');
+  const routes: Record<string, Route> = { '/': page(`<a href="mailto:info@acme.co.nz">mail</a>${links}`) };
+  for (let i = 0; i < 8; i++) routes[`/p${i}`] = { body: page(`<p>p${i}@acme.co.nz</p>`), delayMs: 250 };
+  const s = await startServer(routes);
+  try {
+    const r = await scrapeSite(s.url + '/', { browserPages: 0, budgetMs: 400, pageConcurrency: 1 });
+    assert.equal(r.error, undefined);
+    assert.ok(r.budgetQueued && r.budgetQueued > 0 && r.budgetQueued < 8, `queued ${r.budgetQueued}`);
+    assert.equal(r.resume?.queued.length, r.budgetQueued);
+    assert.equal(r.resume?.attempts, r.pages); // the landing page plus every page fetched
+
+    const r2 = await resumeSite(r, { budget: true, limited: false }, { browserPages: 0, budgetMs: 30_000 });
+    assert.deepEqual(emailsOf(r2), ['info@acme.co.nz', ...Array.from({ length: 8 }, (_, i) => `p${i}@acme.co.nz`)].sort());
+    assert.equal(r2.pages, 9);
+    assert.equal(r2.budgetQueued, undefined);
+    assert.equal(r2.resume, undefined);
+    assert.equal(s.hits.filter((h) => h === '/').length, 1, 'the landing page is not fetched again');
+    for (let i = 0; i < 8; i++) assert.equal(s.hits.filter((h) => h === `/p${i}`).length, 1, `/p${i} fetched once`);
+  } finally {
+    await s.close();
+  }
+});
+
+test('rate-limited pages are saved, and resumeSite retries just them and the links they lead to', async () => {
+  const routes: Record<string, Route> = {
+    '/': page('<a href="mailto:info@acme.co.nz">mail</a><a href="/team">Team</a><a href="/contact">Contact</a>'),
+    '/team': { status: 429, headers: { 'retry-after': '1' }, body: '' },
+    '/contact': page('<p>contact@acme.co.nz</p>'),
+  };
+  const s = await startServer(routes);
+  try {
+    const r = await scrapeSite(s.url + '/', NO_BROWSER);
+    assert.equal(r.rateLimited, 1);
+    assert.deepEqual(r.resume?.limited, [[s.url + '/team', 1]]);
+    assert.deepEqual(r.resume?.queued, []);
+    resetHostPacing();
+
+    routes['/team'] = page('<p>team@acme.co.nz</p><a href="/staff">Staff</a><a href="/contact">Contact</a>');
+    routes['/staff'] = page('<p>staff@acme.co.nz</p>');
+    const mark = s.hits.length;
+    const r2 = await resumeSite(r, { budget: false, limited: true }, NO_BROWSER);
+    assert.deepEqual(s.hits.slice(mark), ['/team', '/staff']);
+    assert.deepEqual(emailsOf(r2), ['contact@acme.co.nz', 'info@acme.co.nz', 'staff@acme.co.nz', 'team@acme.co.nz']);
+    assert.equal(r2.rateLimited, undefined);
+    assert.equal(r2.resume, undefined);
+    assert.equal(r2.pages, r.pages + 2);
+  } finally {
+    resetHostPacing();
+    await s.close();
+  }
+});
+
+/** A v3 row as a time-limited, rate-limited crawl of `url` would have left it. */
+function savedRow(url: string, extra: Partial<SiteResult> = {}): SiteResult {
+  return {
+    v: 3, site: url + '/', finalUrl: url + '/', business: 'Acme', pages: 2, usedBrowser: false, rateLimited: 1, budgetQueued: 1,
+    emails: [{ email: 'info@acme.co.nz', name: null, link: url + '/' }],
+    resume: { queued: [[url + '/q', 1]], limited: [[url + '/l', 1]], seen: [url + '/', url + '/l', url + '/done'], attempts: 3 },
+    ...extra,
+  };
+}
+
+test('resumeSite carries the parts it was not asked to do over to the next run', async () => {
+  const s = await startServer({
+    '/q': page('<p>q@acme.co.nz</p><a href="/done">old</a>'),
+    '/l': page('<p>l@acme.co.nz</p><a href="/q">queued</a>'),
+  });
+  try {
+    const prev = savedRow(s.url);
+    const r = await resumeSite(prev, { budget: false, limited: true }, NO_BROWSER);
+    assert.deepEqual(s.hits, ['/robots.txt', '/l']); // /q stays queued for the budget retry, even though /l links to it
+    assert.deepEqual(r.resume?.queued, [[s.url + '/q', 1]]);
+    assert.deepEqual(r.resume?.limited, []);
+    assert.equal(r.budgetQueued, 1);
+    assert.equal(r.rateLimited, undefined);
+
+    const r2 = await resumeSite(r, { budget: true, limited: false }, NO_BROWSER);
+    assert.deepEqual(s.hits.slice(2), ['/q']); // /done was fetched by the first crawl
+    assert.deepEqual(emailsOf(r2), ['info@acme.co.nz', 'l@acme.co.nz', 'q@acme.co.nz']);
+    assert.equal(r2.resume, undefined);
+    assert.equal(r2.pages, 4);
+  } finally {
+    await s.close();
+  }
+});
+
+test('resumeSite keeps the earlier result when robots.txt now disallows the site', async () => {
+  const s = await startServer({ '/robots.txt': { type: 'text/plain', body: 'User-agent: *\nDisallow: /\n' }, '/q': page('<p>q@acme.co.nz</p>') });
+  try {
+    const prev = savedRow(s.url);
+    assert.equal(await resumeSite(prev, { budget: true, limited: true }, NO_BROWSER), prev);
+    assert.ok(!s.hits.includes('/q'));
+  } finally {
+    await s.close();
+  }
+});
+
+test('resumeSite with the page cap used up fetches nothing and keeps the queue', async () => {
+  const s = await startServer({ '/q': page('<p>q@acme.co.nz</p>') });
+  try {
+    const prev = savedRow(s.url, { rateLimited: undefined });
+    prev.resume = { ...prev.resume!, limited: [], attempts: 10 };
+    const r = await resumeSite(prev, { budget: true, limited: false }, { ...NO_BROWSER, maxPages: 10 });
+    assert.ok(!s.hits.includes('/q'));
+    assert.deepEqual(r.resume?.queued, [[s.url + '/q', 1]]);
+    assert.equal(r.budgetQueued, 1);
+    const r2 = await resumeSite(r, { budget: true, limited: false }, { ...NO_BROWSER, maxPages: 11 });
+    assert.deepEqual(emailsOf(r2), ['info@acme.co.nz', 'q@acme.co.nz']);
+  } finally {
     await s.close();
   }
 });

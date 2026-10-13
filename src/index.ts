@@ -4,9 +4,9 @@ import { parse } from 'csv-parse/sync';
 import { stringify } from 'csv-stringify/sync';
 import pLimit from 'p-limit';
 import type { LevelWithSilent } from 'pino';
-import { acquireLock, beginScrape, cacheFiles, endScrape, ensureTrailingNewline, isRetryable, loadCache, LockedError, writeCacheAtomic } from './cache.js';
-import { parseArgs, rawFlag } from './cli.js';
-import { CACHE_VERSION, closeBrowser, DEFAULT_OPTIONS, QUICK_OPTIONS, scrapeSite, setHostConcurrency, type CrawlOptions, type SiteResult } from './crawler.js';
+import { acquireLock, beginScrape, budgetRetry, cacheFiles, endScrape, ensureTrailingNewline, loadCache, LockedError, planRetries, writeCacheAtomic, type RetryFlags } from './cache.js';
+import { parseArgs, rawFlag, RETRY_FLAGS, retryOptions } from './cli.js';
+import { CACHE_VERSION, closeBrowser, DEFAULT_OPTIONS, QUICK_OPTIONS, resumeSite, scrapeSite, setHostConcurrency, type CrawlOptions, type ResumeParts, type SiteResult } from './crawler.js';
 import { readSites } from './input.js';
 import { initFileLogging, installProcessHandlers, log, LOG_DIR, parseLevel, runId, withLogContext } from './logger.js';
 import { buildRows, recheckSite, uniqueLabel, uniqueRows, type Row } from './output.js';
@@ -22,15 +22,17 @@ interface RunOptions extends CrawlOptions {
 }
 
 /**
- * Scrapes one site under a hard time limit. At the limit the scrape is aborted and has STOP_GRACE_MS to
- * return what it found; only a scrape that won't stop (or crashes) falls back to an empty result.
- * Never rejects, so one broken site never stops the run.
+ * Scrapes one site under a hard time limit, or continues it from `from` (resumeSite). At the limit the scrape
+ * is aborted and has STOP_GRACE_MS to return what it found; only a scrape that won't stop (or crashes) falls
+ * back to an empty result, or to the earlier result when resuming. Never rejects, so one broken site never
+ * stops the run.
  */
-function runSite(site: string, opts: RunOptions): Promise<SiteResult> {
+function runSite(site: string, opts: RunOptions, from?: { prev: SiteResult; parts: ResumeParts }): Promise<SiteResult> {
   const limitMs = opts.budgetMs + HARD_TIMEOUT_EXTRA_MS;
-  const empty = (error: string): SiteResult => ({
+  const empty = (error: string): SiteResult => from?.prev ?? {
     v: CACHE_VERSION, site, finalUrl: site, business: baseHost(new URL(site).hostname), emails: [], pages: 0, usedBrowser: false, error,
-  });
+  };
+  const lost = from ? 'this pass is lost and the earlier result kept' : 'its partial results are lost';
   return new Promise((resolve) => {
     const ctl = new AbortController();
     let settled = false;
@@ -46,12 +48,13 @@ function runSite(site: string, opts: RunOptions): Promise<SiteResult> {
       log.warn({ timeoutMs: limitMs }, `stopped after the ${Math.round(limitMs / 60_000)}-minute hard limit; keeping what it found`);
       ctl.abort();
       grace = setTimeout(() => {
-        log.warn({ graceMs: STOP_GRACE_MS }, `did not stop within ${STOP_GRACE_MS / 1000} s after the hard limit; its partial results are lost`);
+        log.warn({ graceMs: STOP_GRACE_MS }, `did not stop within ${STOP_GRACE_MS / 1000} s after the hard limit; ${lost}`);
         finish(empty('timeout'));
       }, STOP_GRACE_MS);
     }, limitMs);
-    scrapeSite(site, opts, ctl.signal).then(finish, (err) => {
-      log.error({ err }, 'scraper bug while crawling this site (recorded as internal-error); stack trace in logs/error-<date>.log');
+    const run = from ? resumeSite(from.prev, from.parts, opts, ctl.signal) : scrapeSite(site, opts, ctl.signal);
+    run.then(finish, (err) => {
+      log.error({ err }, `scraper bug while crawling this site (${from ? 'earlier result kept' : 'recorded as internal-error'}); stack trace in logs/error-<date>.log`);
       finish(empty('internal-error'));
     });
   });
@@ -112,7 +115,14 @@ function writeSummary(layout: FileLayout, sites: string[], done: Map<string, Sit
   if (limited.length) {
     const pages = limited.reduce((n, r) => n + r.rateLimited!, 0);
     const worst = [...limited].sort((a, b) => b.rateLimited! - a.rateLimited!).slice(0, 5).map((r) => `${host(r)} (${r.rateLimited})`);
-    lines.push(`  Limited  : ${pages} page(s) skipped on ${limited.length} site(s) because the server rate-limited the scraper (HTTP 429/503): ${worst.join(', ')}`);
+    lines.push(`  Limited  : ${pages} page(s) skipped on ${limited.length} site(s) because the server rate-limited the scraper (HTTP 429/503): ${worst.join(', ')}; fetch them with --retry-rate-limited`);
+  }
+  const outOfTime = results.filter(budgetRetry);
+  if (outOfTime.length) {
+    const queued = (r: SiteResult) => r.budgetQueued ?? r.resume?.queued.length ?? 0;
+    const pages = outOfTime.reduce((n, r) => n + queued(r), 0);
+    const worst = [...outOfTime].sort((a, b) => queued(b) - queued(a)).slice(0, 5).map((r) => `${host(r)} (${queued(r) || 'browser'})`);
+    lines.push(`  Out of time: ${outOfTime.length} site(s) ran out of time budget with ${pages} page(s) still queued: ${worst.join(', ')}; continue them with --retry-budget-queued=MIN`);
   }
   if (top.length) lines.push(`  Top sites: ${top.map((r) => `${host(r)} (${r.emails.length})`).join(', ')}`);
   if (failed.length) lines.push(`  Failed sites:\n${failed.map((r) => `    - ${host(r)} [${r.error}]`).join('\n')}`);
@@ -123,7 +133,8 @@ function writeSummary(layout: FileLayout, sites: string[], done: Map<string, Sit
   log.info({ sites: sites.length, withEmails: withEmails.length, noEmails: noEmails.length, failed: failed.length, uniqueEmails, failures: Object.fromEntries(reasons) }, '\n' + text);
 }
 
-async function processFile(file: string, layout: FileLayout, opts: RunOptions, retryFailed: boolean, summaryOnly = false): Promise<void> {
+/** `retry` is set for a --retry-* run: only the sites it selects are crawled, the rest come from the cache. */
+async function processFile(file: string, layout: FileLayout, opts: RunOptions, retry: RetryFlags | null, summaryOnly = false): Promise<void> {
   const startedAt = Date.now();
   const { base, outFile } = layout;
   fs.mkdirSync(layout.cacheDir, { recursive: true });
@@ -154,22 +165,24 @@ async function processFile(file: string, layout: FileLayout, opts: RunOptions, r
     }
 
     if (!summaryOnly) {
-      const { resumed, rotatedTo } = beginScrape(cf, fs.existsSync(outFile), retryFailed);
+      const { resumed, rotatedTo } = beginScrape(cf, fs.existsSync(outFile), !!retry);
       if (resumed) log.info({ cacheFile: rel(cf.cache) }, `${layout.id}: resuming an interrupted scrape from the cache`);
       if (rotatedTo) log.info({ previousCache: rel(rotatedTo) }, `${layout.id}: previous cache kept as ${rel(rotatedTo)}`);
       ensureTrailingNewline(cf.cache);
     }
     const done = loadCache(cf.cache);
-    // Results being retried that found emails: a retry that finds fewer (rate-limited again) keeps these.
-    const previous = new Map<string, SiteResult>();
-    if (retryFailed) {
-      for (const [site, r] of done) {
-        if (!isRetryable(r)) continue;
-        if (r.emails.length) previous.set(site, r);
-        done.delete(site);
-      }
-      // Earlier results stay in the file (a later line wins in loadCache), so an interrupted retry loses nothing.
-      writeCacheAtomic(cf.cache, [...previous.values(), ...done.values()]);
+    // Re-crawled results that found emails: a re-crawl that finds fewer (rate-limited again) keeps these.
+    let previous = new Map<string, SiteResult>();
+    const resumes = new Map<string, { prev: SiteResult; parts: ResumeParts }>();
+    if (retry) {
+      const plan = planRetries(done, retry);
+      previous = plan.previous;
+      for (const [site, parts] of plan.resume) resumes.set(site, { prev: done.get(site)!, parts });
+      for (const site of [...plan.recrawl, ...plan.resume.keys()]) done.delete(site);
+      // Rows being redone stay in the file until their new line supersedes them (a later line wins in loadCache),
+      // so an interrupted retry loses nothing. Only failures with nothing found are dropped, to be scraped again.
+      writeCacheAtomic(cf.cache, [...previous.values(), ...[...resumes.values()].map((x) => x.prev), ...done.values()]);
+      log.info({ recrawl: plan.recrawl.size, resume: plan.resume.size }, `${layout.id}: retrying ${plan.recrawl.size + plan.resume.size} site(s): ${plan.recrawl.size} crawled again from the start, ${plan.resume.size} continued from where they stopped`);
     }
     log.info({ input: rel(file), sites: sites.length, cached: done.size }, `\n=== ${layout.id}: ${sites.length} sites (${done.size} cached) ===`);
 
@@ -181,7 +194,8 @@ async function processFile(file: string, layout: FileLayout, opts: RunOptions, r
           if (done.has(site) || summaryOnly) return;
           const t0 = Date.now();
           log.debug('site started');
-          let r = await runSite(site, opts);
+          const from = resumes.get(site);
+          let r = await runSite(site, opts, from);
           const prev = previous.get(site);
           if (prev && r.emails.length < prev.emails.length) {
             log.info({ emails: r.emails.length, previousEmails: prev.emails.length }, `retry found ${r.emails.length} emails, fewer than the ${prev.emails.length} before; keeping the earlier result`);
@@ -192,7 +206,8 @@ async function processFile(file: string, layout: FileLayout, opts: RunOptions, r
           n++;
           const ms = Date.now() - t0;
           const fields = { finalUrl: r.finalUrl, emails: r.emails.length, pages: r.pages, usedBrowser: r.usedBrowser, error: r.error, durationMs: ms };
-          const msg = `[${n}/${sites.length}] ${baseHost(new URL(site).hostname)} — ${r.emails.length} emails, ${r.pages} pages${r.usedBrowser ? ', browser' : ''}${r.rateLimited ? `, ${r.rateLimited} pages rate-limited` : ''}${r.error ? `, ${r.error}` : ''} (${(ms / 1000).toFixed(0)}s)`;
+          const resumed = from ? ` (resumed: +${r.emails.length - from.prev.emails.length} emails, +${r.pages - from.prev.pages} pages)` : '';
+          const msg = `[${n}/${sites.length}] ${baseHost(new URL(site).hostname)} — ${r.emails.length} emails, ${r.pages} pages${resumed}${r.usedBrowser ? ', browser' : ''}${r.rateLimited ? `, ${r.rateLimited} pages rate-limited` : ''}${r.budgetQueued ? `, ${r.budgetQueued} queued at time limit` : ''}${r.error ? `, ${r.error}` : ''} (${(ms / 1000).toFixed(0)}s)`;
           if (r.error && !r.emails.length) log.warn(fields, msg);
           else log.info(fields, msg);
         })),
@@ -207,7 +222,8 @@ async function processFile(file: string, layout: FileLayout, opts: RunOptions, r
     const withEmails = sites.filter((s) => (checked.get(s)?.emails.length ?? 0) > 0).length;
     const failed = sites.filter((s) => { const r = checked.get(s); return r?.error && !r.emails.length; }).length;
     log.info({ output: rel(outFile), emails: rows.length, withEmails, failed }, `=> ${rel(outFile)}: ${rows.length} emails from ${withEmails}/${sites.length} sites (${failed} failed/unreachable)`);
-    const mode = summaryOnly ? 'summary rebuilt from cache' : `${retryFailed ? 'retry-failed' : 'scrape'}: ${describe(opts)}`;
+    const retried = retry ? [retry.failed && 'failed', retry.rateLimited && 'rate-limited', retry.budget && 'budget-queued'].filter(Boolean) : [];
+    const mode = summaryOnly ? 'summary rebuilt from cache' : `${retried.length ? `retry ${retried.join(' + ')}` : 'scrape'}: ${describe(opts)}`;
     writeSummary(layout, sites, checked, rows.length, mode, startedAt);
     if (!summaryOnly) endScrape(cf);
   } finally {
@@ -291,12 +307,15 @@ async function main() {
   }
   initFileLogging(level);
   if (levelError) throw levelError;
-  const { flags, values, files: fileArgs } = parseArgs(argv);
+  const parsed = parseArgs(argv);
+  const { flags, values, files: fileArgs } = parsed;
   const force = flags.has('force');
-  const retryFailed = flags.has('retry-failed');
+  const retryOpts = retryOptions(parsed);
+  const retry = retryOpts.failed || retryOpts.rateLimited || retryOpts.budget ? retryOpts : null;
   const summaryOnly = flags.has('summary-only'); // rebuild CSV + summary log from the cache, no scraping
+  if (summaryOnly && retry) throw new Error(`--summary-only rebuilds outputs without crawling; it can't be used with --${RETRY_FLAGS.filter((f) => flags.has(f)).join(', --')}`);
   if (flags.has('unique')) {
-    const other = ['force', 'retry-failed', 'summary-only', 'quick'].filter((f) => flags.has(f));
+    const other = ['force', ...RETRY_FLAGS, 'summary-only', 'quick'].filter((f) => flags.has(f));
     if (other.length) throw new Error(`--unique only combines existing outputs; it can't be used with --${other.join(', --')}`);
     runUnique(fileArgs);
     return;
@@ -306,7 +325,7 @@ async function main() {
     maxPages: values.get('max-pages') ?? base.maxPages,
     browserPages: values.get('browser-pages') ?? base.browserPages,
     maxDepth: values.get('max-depth') ?? base.maxDepth,
-    budgetMs: (values.get('budget') ?? base.budgetMs / 60_000) * 60_000,
+    budgetMs: (retryOpts.budgetMin ?? values.get('budget') ?? base.budgetMs / 60_000) * 60_000,
     concurrency: Math.max(1, values.get('concurrency') ?? 12),
     pageConcurrency: Math.max(1, values.get('page-concurrency') ?? base.pageConcurrency),
     hostConcurrency: Math.max(1, values.get('host-concurrency') ?? 3),
@@ -338,12 +357,12 @@ async function main() {
   for (const { file: f, layout } of targets) {
     if (!fs.existsSync(f)) { log.error({ input: f }, `Not found: ${f}`); continue; }
     const interrupted = fs.existsSync(cacheFiles(layout.cacheDir, layout.base).marker);
-    if (!files.length && !force && !retryFailed && !summaryOnly && fs.existsSync(layout.outFile) && !interrupted) {
+    if (!files.length && !force && !retry && !summaryOnly && fs.existsSync(layout.outFile) && !interrupted) {
       log.info({ input: path.relative(ROOT, f) }, `Skipping ${path.relative(IN_DIR, f)} (output exists; use --force)`);
       continue;
     }
     try {
-      await withLogContext({ file: layout.id }, () => processFile(f, layout, opts, retryFailed, summaryOnly));
+      await withLogContext({ file: layout.id }, () => processFile(f, layout, opts, retry, summaryOnly));
     } catch (err) {
       if (!(err instanceof LockedError)) throw err;
       log.error({ input: path.relative(ROOT, f), err }, `Skipping ${path.relative(IN_DIR, f)}: ${err.message}`);

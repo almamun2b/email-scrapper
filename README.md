@@ -22,6 +22,7 @@ Built with TypeScript on Node.js. It uses [cheerio](https://cheerio.js.org/) to 
 - [Command reference](#command-reference)
 - [Crawl options (depth and limits)](#crawl-options-depth-and-limits)
 - [Running long jobs](#running-long-jobs)
+- [Retrying and continuing sites](#retrying-and-continuing-sites)
 - [Running the Australian lists](#running-the-australian-lists)
 - [Summary logs](#summary-logs)
 - [Diagnostic logs](#diagnostic-logs)
@@ -147,7 +148,9 @@ With no arguments, each category folder in `emails/` gets its own combined list,
 | `npm run scrape` | Scrape every list in `websites/` (and its category folders) that has no output in `emails/` yet |
 | `npm run scrape -- websites/dealers/a.csv [b.csv …]` | Scrape specific files. This always re-scrapes, even if an output exists |
 | `npm run scrape -- --force` | Re-scrape all files in `websites/` from scratch |
-| `npm run scrape -- --retry-failed` | Re-scrape only sites that failed with no emails (unreachable, timeout, …) or had pages skipped by rate limiting. The existing cache is reused as is, and everything else is kept, including `robots-disallowed` sites. A retried site that comes back with fewer emails keeps its earlier result. Rebuilds the CSVs and logs |
+| `npm run scrape -- --retry-failed` | Crawl again, from the start, only the sites that failed with no emails (unreachable, timeout, …). Everything else comes from the cache. Rebuilds the CSVs and logs. See [Retrying and continuing sites](#retrying-and-continuing-sites) |
+| `npm run scrape -- --retry-rate-limited` | Fetch again only the pages a server refused with HTTP 429/503 (and the new links on them), and merge what they give into each site's result |
+| `npm run scrape -- --retry-budget-queued[=MIN]` | Continue the sites that ran out of time budget from where they stopped: only the pages still queued are fetched, with a budget of `MIN` minutes per site (default: `--budget`) |
 | `npm run scrape -- --summary-only` | Scrape nothing. Rebuild the CSVs and summary logs from the cache, applying the current email and name rules. Skips (and leaves untouched) a file with no cache or an interrupted scrape |
 | `npm run scrape -- --unique` | Scrape nothing. Combine each category's outputs into `emails/<category>/unique/<category>.csv` with each email once. See [Unique emails across files](#unique-emails-across-files) |
 | `npm run scrape -- --unique websites/dealers/au.*.csv` | Same, for only the named files: writes `emails/dealers/unique/au.csv` |
@@ -161,7 +164,7 @@ The `--` after `npm run scrape` is required. It passes everything after it to th
 Flags and file arguments can be combined in any order:
 
 ```bash
-npm run scrape -- websites/a.csv --retry-failed
+npm run scrape -- websites/a.csv --retry-failed --retry-rate-limited --retry-budget-queued=60
 ```
 
 ```bash
@@ -207,7 +210,7 @@ There is **no depth limit by default**. The crawler follows links as deep as the
 | `--max-pages=N` | Max page requests per site with plain HTTP (phase 1) | 400 | 150 |
 | `--browser-pages=N` | Max page requests per site in the headless-browser fallback (phase 2). `0` turns the fallback off | 60 | 30 |
 | `--max-depth=N` | Max click level to follow from the start page. `0` = unlimited | 0 (unlimited) | 0 (unlimited) |
-| `--budget=MIN` | Soft time budget per site in minutes. When it runs out, the site stops and keeps what it found. A hard stop happens 4 minutes later, and it also keeps what was found | 20 | 10 |
+| `--budget=MIN` | Soft time budget per site in minutes. When it runs out, the site stops, keeps what it found and saves the pages it still had queued, so `--retry-budget-queued` can continue it later. A hard stop happens 4 minutes later, and it also keeps (and saves) what was found | 20 | 10 |
 | `--concurrency=N` | Websites crawled in parallel | 12 | 12 |
 | `--page-concurrency=N` | Parallel page requests within one site (HTTP phase) | 3 | 3 |
 | `--host-concurrency=N` | Parallel requests to one server, across all sites | 3 | 3 |
@@ -228,14 +231,14 @@ When to change them:
 The most aggressive setting you might use is `--concurrency=24 --page-concurrency=4 --host-concurrency=4`. It is safe for your data and your machine, but it is more aggressive than most runs need. It is not recommended as a first run.
 
 **What can't go wrong**
-- Nothing is lost if it overloads. Each finished site is saved to the cache, and `--retry-failed` redoes the failures.
+- Nothing is lost if it overloads. Each finished site is saved to the cache, `--retry-failed` redoes the failures, and `--retry-rate-limited` / `--retry-budget-queued` fetch the pages that were refused or ran out of time.
 - Memory stays bounded. Browser pages are capped at 4 at once, whatever the other numbers are.
 - It respects `robots.txt`, and 4 requests at a time to one server is gentle for any single host.
 
 **What can go wrong**
 - The peak is `concurrency × page-concurrency`, which is 24 × 4 = 96 requests in flight at once. Home routers, VPNs and Wi-Fi often struggle past roughly 50–100. That shows up as spurious `unreachable` or `timeout` failures and slower crawls.
 - The per-server cap counts hostnames, not shared platforms. Hundreds of dealer sites run on the same platforms and CDNs, so those providers can still see a burst. Some rate-limit or block it, and blocked sites then look like "no emails found".
-- Heavily loaded sites hit the per-site budget (`--budget`, 20 minutes by default) sooner and return partial results, so you can get fewer emails.
+- Heavily loaded sites hit the per-site budget (`--budget`, 20 minutes by default) sooner and return partial results, so you can get fewer emails until you continue them with `--retry-budget-queued`.
 
 **Recommended approach:** start with a moderate setting and watch the first file's failure counts in `emails/<category>/logs/<name>.log`. Raise the numbers only if the failures stay low.
 
@@ -243,7 +246,7 @@ The most aggressive setting you might use is `--concurrency=24 --page-concurrenc
 npm run scrape -- --concurrency=16 --page-concurrency=3 --host-concurrency=3
 ```
 
-If failures are high, lower the numbers, or run `--retry-failed` afterwards.
+If failures are high, lower the numbers, or run `--retry-failed` (and `--retry-rate-limited`) afterwards.
 
 Examples:
 
@@ -305,11 +308,48 @@ After a run finishes:
 - Emails are unique within each file. For one list without repeats across files, run `npm run scrape -- --unique websites/dealers/au.*.csv` (writes `emails/dealers/unique/au.csv`).
 - `logs/error-<date>.log` lists every error from the run with its stack trace. If it's empty, nothing went wrong internally. See [Diagnostic logs](#diagnostic-logs).
 - If many sites failed with `unreachable` or `timeout` (often network hiccups), run `npm run scrape -- websites/<name>.csv --retry-failed`.
+- If the summary has a `Limited` or `Out of time` line, run `--retry-rate-limited` or `--retry-budget-queued=MIN`. See [Retrying and continuing sites](#retrying-and-continuing-sites).
 - If failures read `browserType.launch: Executable doesn't exist …`, Playwright's Chromium isn't installed, or doesn't match the installed Playwright version. Every site that needs the browser fallback then fails. Fix it with the command below, then rerun with `--retry-failed`:
 
   ```bash
   npx playwright install chromium
   ```
+
+## Retrying and continuing sites
+
+A finished run can leave three kinds of unfinished work. Each has its own flag, and they can be combined in one run. Only the selected sites are crawled; every other site comes from the cache, and the CSV and summary are rebuilt from all of them.
+
+| Flag | Which sites | What it does |
+|---|---|---|
+| `--retry-failed` | Failed with no emails (`unreachable`, `timeout`, `browser-error`, `internal-error`) | Crawls them again from the start |
+| `--retry-rate-limited` | A server refused some pages with HTTP 429/503 even after one retry (the summary's `Limited` line) | Fetches only those pages, plus any new links found on them. Pages already fetched are not fetched again |
+| `--retry-budget-queued[=MIN]` | Ran out of time budget with pages still queued (the summary's `Out of time` line), or before the headless-browser phase could run | Continues the saved queue with `MIN` minutes per site, then runs the browser phase if it is still owed. Pages already fetched are not fetched again |
+
+```bash
+npm run scrape -- websites/churches/au.churches.csv --retry-budget-queued=60
+```
+
+```bash
+npm run scrape -- websites/gifts/*.csv --retry-failed --retry-rate-limited --retry-budget-queued=40
+```
+
+- **Nothing is lost.** New emails are merged into the site's earlier ones. A site still unfinished after a retry (it ran out of time again, or was refused again) saves what is left, so the same command continues it further. Parts you didn't ask for are kept for later: `--retry-rate-limited` leaves a site's time-budget queue alone, and the other way round.
+- **The budget.** `--retry-budget-queued=60` is the same as `--retry-budget-queued --budget=60`; give it one way, not both. Sites with a `Crawl-delay` need it: at 10 seconds per page, 20 minutes is only about 120 pages.
+- **The page cap still counts.** A continued site can use the rest of its `--max-pages` (400 by default). If the first crawl already used it up, the queue is kept and the log says so; raise `--max-pages` to continue.
+- **Up to 2000 queued pages are saved per site,** best first. Pages past that can still be found again through links.
+- **Without a file argument** the retries go through every list under `websites/`, including those that already have an output.
+
+**Sites scraped before this feature** have no saved queue, so `--retry-budget-queued` can't see them. `scripts/mark-budget-from-logs.ts` finds them in `logs/scraper-*.log` (the `time budget used up` lines) and marks their cache rows. A marked site is crawled again from the start with the new budget, and keeps its earlier result if that finds fewer emails. The same goes for rate-limited sites from older runs, which only have a count of skipped pages.
+
+```bash
+npx tsx scripts/mark-budget-from-logs.ts
+```
+
+```bash
+npx tsx scripts/mark-budget-from-logs.ts --write
+```
+
+The first command only shows what it would mark. `--write` appends the marked rows to the caches (the last line wins; nothing is rewritten or deleted). A row is only marked if its page count still matches the log line, so a site scraped again since is left alone, and a file that a run is working on (or that has an interrupted scrape) is skipped.
 
 ## Running the Australian lists
 
@@ -332,10 +372,10 @@ Or run one list at a time:
 npm run scrape -- websites/dealers/au.toyota.csv
 ```
 
-Afterwards, retry the sites that failed. The `--retry-failed` run keeps everything else:
+Afterwards, retry the sites that failed and continue the ones that were rate-limited or ran out of time. Everything else is kept:
 
 ```bash
-npm run scrape -- websites/dealers/au.*.csv --retry-failed
+npm run scrape -- websites/dealers/au.*.csv --retry-failed --retry-rate-limited --retry-budget-queued=40
 ```
 
 Rebuild the CSVs and logs from the cache without touching the network:
@@ -362,6 +402,7 @@ After each CSV is processed, a summary is printed and **appended** to `emails/<c
   Emails   : 241 unique (51 person name, 0 department page title, 190 business name)
   Crawl    : 3919 pages fetched | headless browser used on 17 sites
   Failures : unreachable=5
+  Out of time: 2 site(s) ran out of time budget with 317 page(s) still queued: vetent.co.nz (176), carevets.co.nz (141); continue them with --retry-budget-queued=MIN
   Top sites: vetent.co.nz (25), myfarmfirst.co.nz (24), carevets.co.nz (23), ...
   Failed sites:
     - clivevets.co.nz [unreachable]
@@ -382,7 +423,9 @@ Failure reasons:
 
 "No emails found" means the site was crawled successfully but publishes no email address. Often it only has a contact form.
 
-A `Limited : N page(s) skipped on M site(s) …` line means those servers answered HTTP 429 (Too Many Requests) or 503 (Service Unavailable) even after one retry, so those pages were skipped. The busiest servers are listed. A few is normal. The scraper already slows down for a server that answers 429/503 (see [Politeness and robots.txt](#politeness-and-robotstxt)), so `--retry-failed` is usually enough: it re-crawls every site with skipped pages and keeps the earlier result if the retry finds fewer emails. If the line stays large, re-scrape that file with fewer parallel requests (`--host-concurrency=2`, or `--concurrency=6`). The per-site progress line also shows `N pages rate-limited`.
+A `Limited : N page(s) skipped on M site(s) …` line means those servers answered HTTP 429 (Too Many Requests) or 503 (Service Unavailable) even after one retry, so those pages were skipped. The busiest servers are listed. A few is normal. The scraper already slows down for a server that answers 429/503 (see [Politeness and robots.txt](#politeness-and-robotstxt)), so `--retry-rate-limited` is usually enough: it fetches just the skipped pages again. If the line stays large, run it with fewer parallel requests (`--host-concurrency=1`, or `--concurrency=6`). The per-site progress line also shows `N pages rate-limited`.
+
+An `Out of time: N site(s) …` line means those sites used up their time budget with pages still queued (`browser` instead of a count means the headless-browser phase didn't get to run). The most-queued sites are listed. `--retry-budget-queued=MIN` continues them where they stopped; see [Retrying and continuing sites](#retrying-and-continuing-sites). The per-site progress line also shows `N queued at time limit`, and a continued site shows `(resumed: +X emails, +Y pages)`.
 
 ## Diagnostic logs
 
@@ -404,7 +447,7 @@ Besides the per-file summaries, every run writes structured diagnostic logs with
 
 | Level | What is logged |
 |---|---|
-| `info` (default) | Run/file/site progress, robots.txt blocks, sites that ran out of time budget |
+| `info` (default) | Run/file/site progress, robots.txt blocks, sites that ran out of time budget (with the number of pages still queued) |
 | `warn` | Sites that failed with no emails; the first page each server refused with 429/503 after a retry (the rest are counted in the summary); a server dropping a connection mid-response (once per site); hard timeouts; skipped input rows; unreadable cache lines; SIGINT/SIGTERM |
 | `error` | The headless browser failing on a site or failing to start, a site crashing the scraper, a file skipped because another run holds it |
 | `fatal` | Uncaught exceptions and unhandled rejections; the process exits with code 1 |
@@ -426,7 +469,7 @@ jq -c 'select(.site == "https://example.co.nz/")' logs/scraper-2026-10-03.log
 
 ## Cache and resuming
 
-Each finished site is appended as one JSON line to `emails/<category>/.cache/<name>.jsonl`. The line holds the site URL, final URL after redirects, business name, emails with names, page titles, links and where each email was found (`source`), pages fetched, whether the browser was used, and any error.
+Each finished site is appended as one JSON line to `emails/<category>/.cache/<name>.jsonl`. The line holds the site URL, final URL after redirects, business name, emails with names, page titles, links and where each email was found (`source`), pages fetched, whether the browser was used, and any error. A site that ran out of time or had pages rate-limited also saves what is left (`budgetQueued`, and `resume` with the queued and refused pages and the pages already seen), which the `--retry-*` flags continue from.
 
 Files in `emails/<category>/.cache/` for each input `<name>`:
 
@@ -439,7 +482,7 @@ Files in `emails/<category>/.cache/` for each input `<name>`:
 
 - **Interrupted runs resume automatically,** including interrupted `--force` and explicit-file re-scrapes. Run the same command again (or a plain `npm run scrape`) and cached sites are skipped.
 - **A fresh re-scrape keeps the old cache.** When a file with an existing output is scraped again (`--force` or an explicit file argument), its cache is renamed to `<name>.<timestamp>.jsonl` and a new one is started.
-- **Outputs always use the current rules.** The CSV and summary re-apply the current email checks and name rules to every cached row, so after an update `--summary-only` cleans old outputs without re-scraping. The cache files themselves are never rewritten (except by `--retry-failed`, which drops the failed sites with no emails it is about to redo, via an atomic rename; earlier rows of rate-limited sites are kept until the retry's row supersedes them).
+- **Outputs always use the current rules.** The CSV and summary re-apply the current email checks and name rules to every cached row, so after an update `--summary-only` cleans old outputs without re-scraping. The cache files themselves are never rewritten, except by a `--retry-*` run: it drops the failed sites with no emails it is about to redo (via an atomic rename), while rows it continues or re-crawls are kept until the retry's row supersedes them, so an interrupted retry loses nothing. `scripts/mark-budget-from-logs.ts --write` only appends.
 
 ## How it works
 
@@ -453,7 +496,7 @@ Files in `emails/<category>/.cache/` for each input `<name>`:
 - Follows redirects itself. A page that redirects to another site, or into a path `robots.txt` disallows, is skipped. Gzipped sitemaps are supported.
 - Decodes pages in their declared charset (header or `<meta charset>`), so names on older `windows-1252` sites come out right.
 - Listing detail pages (car stock, offers, news and blog posts) are fetched last, and stock/product sitemaps are read after page sitemaps.
-- Limits (defaults, see [Crawl options](#crawl-options-depth-and-limits)): **400 pages per site**, unlimited depth, 3 parallel requests per site, 15 s per request, 5 MB per page, and a 20-minute budget per site (partial results are kept).
+- Limits (defaults, see [Crawl options](#crawl-options-depth-and-limits)): **400 pages per site**, unlimited depth, 3 parallel requests per site, 15 s per request, 5 MB per page, and a 20-minute budget per site (partial results are kept, and the pages still queued are saved for `--retry-budget-queued`).
 
 ### 2. Headless browser fallback
 
@@ -555,7 +598,7 @@ src/
   urls.ts       URL normalisation, crawlability rules, link priority, section detection
   data/         given-names.txt
 test/           node:test suites and a local test server (npm test)
-scripts/        recheck-cache.ts, given-names-report.ts
+scripts/        recheck-cache.ts, given-names-report.ts, mark-budget-from-logs.ts
 websites/       Input CSVs, in category folders: websites/<category>/*.csv (git-ignored)
 emails/         One folder per category, each with emails/ (the output CSVs), logs/, .cache/ and unique/ (git-ignored)
 logs/           Diagnostic JSON logs: scraper-<date>.log, error-<date>.log (git-ignored)

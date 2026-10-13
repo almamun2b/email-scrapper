@@ -1,6 +1,6 @@
 import fs from 'node:fs';
 import path from 'node:path';
-import type { SiteResult } from './crawler.js';
+import type { ResumeParts, SiteResult } from './crawler.js';
 import { log } from './logger.js';
 
 /**
@@ -73,13 +73,61 @@ export function ensureTrailingNewline(file: string): void {
   if (last[0] !== 0x0a) fs.appendFileSync(file, '\n');
 }
 
-/**
- * Worth re-crawling: a failure with nothing found, or a site where the server rate-limited some pages
- * away. Never a robots.txt block (that won't change).
- */
-export function isRetryable(r: SiteResult): boolean {
+// None of the retries touches a robots.txt block: that won't change.
+
+/** --retry-failed: a failure with nothing found. */
+export function failedRetry(r: SiteResult): boolean {
+  return !!r.error && r.error !== 'robots-disallowed' && r.emails.length === 0;
+}
+
+/** --retry-rate-limited: pages the server refused with 429/503. v3 rows list them; older rows only count them. */
+export function rateLimitedRetry(r: SiteResult): boolean {
   if (r.error === 'robots-disallowed') return false;
-  return (!!r.error && r.emails.length === 0) || (r.rateLimited ?? 0) > 0;
+  return (r.v ?? 0) >= 3 ? !!r.resume?.limited.length : (r.rateLimited ?? 0) > 0;
+}
+
+/** --retry-budget-queued: the time budget ran out with pages still queued, or before the browser phase ran. */
+export function budgetRetry(r: SiteResult): boolean {
+  if (r.error === 'robots-disallowed') return false;
+  return (r.budgetQueued ?? 0) > 0 || !!r.resume?.queued.length || !!r.resume?.browser;
+}
+
+export interface RetryFlags {
+  failed: boolean;
+  rateLimited: boolean;
+  budget: boolean;
+}
+
+export interface RetryPlan {
+  recrawl: Set<string>; // crawled again from the start
+  resume: Map<string, ResumeParts>; // continued from their saved state (resumeSite)
+  previous: Map<string, SiteResult>; // re-crawled rows with emails: kept if the re-crawl finds fewer
+}
+
+/**
+ * Which cached sites a retry run redoes, and how. A failure is crawled again from the start. Rate-limited
+ * pages and a queue left by the time budget are continued from the row's saved state; a row without one
+ * (scraped before v3, or marked from the logs) is crawled again instead, keeping its result if that finds fewer.
+ */
+export function planRetries(done: Map<string, SiteResult>, flags: RetryFlags): RetryPlan {
+  const plan: RetryPlan = { recrawl: new Set(), resume: new Map(), previous: new Map() };
+  for (const [site, r] of done) {
+    if (flags.failed && failedRetry(r)) {
+      plan.recrawl.add(site);
+      continue;
+    }
+    const parts: ResumeParts = { budget: flags.budget && budgetRetry(r), limited: flags.rateLimited && rateLimitedRetry(r) };
+    if (!parts.budget && !parts.limited) continue;
+    const s = r.resume;
+    const saved = (!parts.budget || !!(s?.queued.length || s?.browser)) && (!parts.limited || !!s?.limited.length);
+    if (saved) {
+      plan.resume.set(site, parts);
+    } else {
+      plan.recrawl.add(site);
+      if (r.emails.length) plan.previous.set(site, r);
+    }
+  }
+  return plan;
 }
 
 /** Replaces the cache file via a temp file and rename, so a crash never leaves it truncated. */
@@ -96,7 +144,7 @@ function stamp(d = new Date()): string {
 /**
  * Called before scraping a file. Resumes when an earlier scrape of it was interrupted (marker present).
  * Otherwise a finished earlier run (output CSV exists) has its cache renamed aside, so it is kept but not
- * reused, unless keepCache is set (--retry-failed builds on the existing cache).
+ * reused, unless keepCache is set (the --retry-* runs build on the existing cache).
  */
 export function beginScrape(files: CacheFiles, outputExists: boolean, keepCache = false): { resumed: boolean; rotatedTo?: string } {
   if (fs.existsSync(files.marker)) return { resumed: true };
