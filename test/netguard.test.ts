@@ -3,16 +3,49 @@ import assert from 'node:assert/strict';
 import http from 'node:http';
 import type { AddressInfo } from 'node:net';
 import { decode, httpGet, retryAfterMs } from '../src/http.js';
-import { isPublicAddress, isPublicHost } from '../src/netguard.js';
+import type { LookupOptions } from 'node:dns';
+import { guardedLookup, isPublicAddress, isPublicHost, setResolver } from '../src/netguard.js';
 
 // No SCRAPER_ALLOW_PRIVATE here: this file checks the guard itself.
 delete process.env.SCRAPER_ALLOW_PRIVATE;
 
 test('private, loopback, link-local and metadata addresses are not public (M9)', () => {
-  for (const ip of ['127.0.0.1', '10.1.2.3', '172.16.5.4', '192.168.1.1', '169.254.169.254', '100.64.0.1', '0.0.0.0', '::1', 'fe80::1', 'fd00::1', '::ffff:127.0.0.1']) {
+  for (const ip of ['127.0.0.1', '10.1.2.3', '172.16.5.4', '192.168.1.1', '169.254.169.254', '100.64.0.1', '0.0.0.0', '::1', 'fe80::1', 'fd00::1', '::ffff:127.0.0.1', '::ffff:7f00:1']) {
     assert.equal(isPublicAddress(ip), false, ip);
   }
-  for (const ip of ['8.8.8.8', '203.0.113.9', '2606:4700::1111']) assert.equal(isPublicAddress(ip), true, ip);
+  for (const ip of ['8.8.8.8', '1.1.1.1', '2606:4700::1111']) assert.equal(isPublicAddress(ip), true, ip);
+});
+
+test('NAT64, 6to4 and documentation ranges are not public either (S3)', () => {
+  for (const ip of ['64:ff9b::7f00:1', '2002:7f00:1::1', '2001:db8::1', '192.0.2.1', '198.51.100.7', '203.0.113.9']) {
+    assert.equal(isPublicAddress(ip), false, ip);
+  }
+});
+
+test('guardedLookup connects only to the addresses it checked, and refuses private ones (S2)', async () => {
+  const lookup = (host: string, options: LookupOptions) => new Promise<{ err: NodeJS.ErrnoException | null; address: unknown; family?: number }>((resolve) => {
+    guardedLookup(host, options, (err, address, family) => resolve({ err, address, family }));
+  });
+  let calls = 0;
+  setResolver(async (host) => {
+    calls++;
+    if (host === 'public.test') return [{ address: '93.184.216.34', family: 4 }, { address: '2606:2800:220:1::1', family: 6 }];
+    if (host === 'rebind.test') return [{ address: '93.184.216.34', family: 4 }, { address: '10.0.0.5', family: 4 }];
+    throw Object.assign(new Error('nope'), { code: 'ENOTFOUND' });
+  });
+  try {
+    assert.deepEqual(await lookup('public.test', {}), { err: null, address: '93.184.216.34', family: 4 });
+    assert.deepEqual((await lookup('public.test', { all: true })).address, [{ address: '93.184.216.34', family: 4 }, { address: '2606:2800:220:1::1', family: 6 }]);
+    assert.deepEqual(await lookup('public.test', { family: 6 }), { err: null, address: '2606:2800:220:1::1', family: 6 });
+    assert.equal(calls, 1, 'resolved once, then cached');
+    assert.equal((await lookup('rebind.test', {})).err?.code, 'EBLOCKED');
+    assert.equal(await isPublicHost('rebind.test'), false);
+    assert.equal((await lookup('gone.test', {})).err?.code, 'ENOTFOUND');
+    await lookup('gone.test', {});
+    assert.equal(calls, 4, 'a failed lookup is not cached');
+  } finally {
+    setResolver(null);
+  }
 });
 
 test('hostnames are checked by what they resolve to', async () => {

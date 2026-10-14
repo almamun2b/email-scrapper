@@ -1,12 +1,15 @@
 import pLimit from 'p-limit';
-import { chromium, type Browser, type BrowserContext } from 'playwright';
-import { UA } from './http.js';
+import { chromium, type Browser, type BrowserContext, type Route } from 'playwright';
+import { untilAborted } from './abort.js';
+import { notePace, UA, withHostSlot } from './http.js';
 import { log } from './logger.js';
 import { isPublicHost } from './netguard.js';
+import { baseHost } from './urls.js';
 
 export interface Fetched {
   html: string;
   url: string; // final URL after redirects
+  disallowed?: boolean; // a redirect led to `url`, which robots.txt disallows, so it wasn't fetched (html is empty)
 }
 export type Fetcher = (url: string) => Promise<Fetched | null>;
 
@@ -52,7 +55,31 @@ export async function closeBrowser(): Promise<void> {
   }
 }
 
-const newContext = (b: Browser) => b.newContext({ userAgent: UA, locale: 'en-AU', ignoreHTTPSErrors: true, acceptDownloads: false });
+/** Skips images, media and fonts, and keeps every request (popups' too) off private and local addresses. */
+async function guardRequest(route: Route): Promise<void> {
+  const req = route.request();
+  const t = req.resourceType();
+  if (t === 'image' || t === 'media' || t === 'font') return route.abort();
+  const u = new URL(req.url());
+  if (/^https?:$/.test(u.protocol) && !(await isPublicHost(u.hostname))) return route.abort('blockedbyclient');
+  return route.continue();
+}
+
+/**
+ * The guards live on the context, not the page, so they also cover popups. Service workers are blocked because
+ * their requests bypass routing, and WebSockets get the same address check as everything else.
+ */
+async function newContext(b: Browser): Promise<BrowserContext> {
+  const c = await b.newContext({ userAgent: UA, locale: 'en-AU', ignoreHTTPSErrors: true, acceptDownloads: false, serviceWorkers: 'block' });
+  await c.route('**/*', guardRequest);
+  await c.routeWebSocket(() => true, async (ws) => {
+    if (await isPublicHost(new URL(ws.url()).hostname)) ws.connectToServer();
+    else await ws.close();
+  });
+  return c;
+}
+
+const CLOSED = /closed|disconnected|Target/i;
 
 /** A browser context for one site, with a page fetcher that matches the HTTP fetcher's contract. */
 export function makeBrowserFetcher(signal?: AbortSignal): { fetcher: Fetcher; close: () => Promise<void> } {
@@ -63,7 +90,7 @@ export function makeBrowserFetcher(signal?: AbortSignal): { fetcher: Fetcher; cl
         .then(newContext)
         .catch(async (err) => {
           // the shared browser died between launch and now: start a fresh one once
-          if (!/closed|disconnected|Target/i.test(String(err))) throw err;
+          if (!CLOSED.test(String(err))) throw err;
           browserPromise = null;
           return newContext(await getBrowser());
         });
@@ -72,31 +99,45 @@ export function makeBrowserFetcher(signal?: AbortSignal): { fetcher: Fetcher; cl
     }
     return ctxPromise;
   };
+  // A context that died with the browser after it was created is replaced once, instead of failing every page.
+  const newPage = async () => {
+    try {
+      return await (await ctx()).newPage();
+    } catch (err) {
+      if (!CLOSED.test(String(err))) throw err;
+      ctxPromise = null;
+      return (await ctx()).newPage();
+    }
+  };
   const fetcher: Fetcher = (url) =>
-    browserLimit(async () => {
+    untilAborted(browserLimit(async () => {
       if (signal?.aborted) return null;
-      const c = await ctx();
-      const page = await c.newPage();
+      const page = await newPage();
+      const stop = () => { page.close().catch(() => {}); }; // cuts a navigation short at the hard time limit
+      signal?.addEventListener('abort', stop, { once: true });
+      page.on('popup', (p) => { p.close().catch(() => {}); });
       try {
-        await page.route('**/*', async (route) => {
-          const req = route.request();
-          const t = req.resourceType();
-          if (t === 'image' || t === 'media' || t === 'font') return route.abort();
-          const u = new URL(req.url());
-          if (/^https?:$/.test(u.protocol) && !(await isPublicHost(u.hostname))) return route.abort('blockedbyclient');
-          return route.continue();
-        });
-        const resp = await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 25_000 });
+        // The same per-server slot, Crawl-delay and rate-limit backoff as the plain-HTTP requests.
+        const resp = await withHostSlot(new URL(url).hostname, signal, () => page.goto(url, { waitUntil: 'domcontentloaded', timeout: 25_000 }));
+        if (resp) notePace(new URL(resp.url()).hostname, resp.status());
         if (!resp || resp.status() >= 400) return null;
         await page.waitForLoadState('networkidle', { timeout: 6_000 }).catch(() => {});
-        return { html: await page.content(), url: page.url() };
+        // Same-site frames' documents are added after the page's own, so their emails and links count too.
+        const site = baseHost(new URL(page.url()).hostname);
+        const frames = page.frames().filter((f) => {
+          if (f === page.mainFrame()) return false;
+          try { return baseHost(new URL(f.url()).hostname) === site; } catch { return false; }
+        }).slice(0, 10);
+        const extra = await Promise.all(frames.map((f) => f.content().catch(() => '')));
+        return { html: [await page.content(), ...extra].join('\n'), url: page.url() };
       } catch (err) {
         log.debug({ url, err: firstLine(err) }, 'browser page failed');
         return null;
       } finally {
+        signal?.removeEventListener('abort', stop);
         await page.close().catch(() => {});
       }
-    });
+    }), signal, null);
   const close = async () => {
     const c = await ctxPromise?.catch(() => null);
     await c?.close().catch(() => {});

@@ -10,9 +10,16 @@ interface Robots {
 }
 const robotsParser = ((robotsModule as any).default ?? robotsModule) as (url: string, txt: string) => Robots;
 
-/** Parsed rules; DISALLOW_ALL when the server errors (RFC 9309); undefined when there is no robots.txt. */
-export type RobotsRules = Robots | typeof DISALLOW_ALL | undefined;
-export const DISALLOW_ALL = 'disallow-all' as const;
+/**
+ * Parsed rules; ROBOTS_UNAVAILABLE when the server errors, which means "keep out" (RFC 9309) but may be temporary;
+ * undefined when there is no robots.txt.
+ */
+export type RobotsRules = Robots | typeof ROBOTS_UNAVAILABLE | undefined;
+export const ROBOTS_UNAVAILABLE = 'robots-unavailable' as const;
+
+/** The SiteResult error for a landing page robots.txt keeps us out of. */
+export type RobotsBlock = 'robots-disallowed' | 'robots-unavailable';
+export const blockReason = (robots: RobotsRules): RobotsBlock => (robots === ROBOTS_UNAVAILABLE ? 'robots-unavailable' : 'robots-disallowed');
 
 const cache = new Map<string, Promise<RobotsRules>>();
 
@@ -37,7 +44,7 @@ async function fetchRobots(origin: string): Promise<RobotsRules> {
   if (!r) return undefined;
   if (r.status >= 500) {
     log.info({ url, status: r.status }, `robots.txt answers HTTP ${r.status}; treating the site as disallowed`);
-    return DISALLOW_ALL;
+    return ROBOTS_UNAVAILABLE;
   }
   if (r.status >= 400 || !/user-agent/i.test(r.body) || /<html/i.test(r.body)) return undefined;
   const robots = robotsParser(url, r.body);
@@ -46,11 +53,20 @@ async function fetchRobots(origin: string): Promise<RobotsRules> {
   return robots;
 }
 
+/**
+ * `robots` must be the rules of `url`'s own origin: robots-parser answers undefined for any other origin, and
+ * that reads as allowed here. SiteCrawl.allows() picks the right rules for each URL.
+ */
 export function allowed(robots: RobotsRules, url: string): boolean {
-  if (robots === DISALLOW_ALL) return false;
+  if (robots === ROBOTS_UNAVAILABLE) return false;
   return robots?.isAllowed(url, UA) !== false;
 }
 
+/** Whether robots.txt lets us fetch `url`, by the rules of the URL's own origin. */
+export async function robotsAllow(url: string): Promise<boolean> {
+  return allowed(await loadRobots(new URL(url).origin), url);
+}
+
 export function sitemapsOf(robots: RobotsRules): string[] {
-  return robots && robots !== DISALLOW_ALL ? robots.getSitemaps() : [];
+  return robots && robots !== ROBOTS_UNAVAILABLE ? robots.getSitemaps() : [];
 }
