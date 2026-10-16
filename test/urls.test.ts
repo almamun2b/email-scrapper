@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { canonical, crawlable, normalizeInput, priority, sectionPrefix } from '../src/urls.js';
+import { canonical, crawlable, normalizeInput, pageKey, priority, sectionPrefix } from '../src/urls.js';
 
 test('priority() survives malformed percent-encoding (H1)', () => {
   assert.equal(typeof priority(new URL('https://x.co.nz/100%-satisfaction'), 1), 'number');
@@ -32,6 +32,35 @@ test('normalizeInput() repairs "www./" and rejects hosts without a real domain',
 
 test('canonical() drops tracking params, hash, www and trailing slash', () => {
   assert.equal(canonical(new URL('https://www.x.nz/a/?utm_source=f&b=1#top')), 'https://x.nz/a?b=1');
+});
+
+test('canonical() keeps the scheme, so URLs saved in earlier caches still match', () => {
+  assert.equal(canonical(new URL('http://www.x.nz/a/?b=1')), 'http://x.nz/a?b=1');
+  assert.equal(canonical(new URL('https://x.nz/')), 'https://x.nz/');
+});
+
+test('pageKey() gives one page one key, however its URL is spelled', () => {
+  const same = [
+    'https://www.x.nz/contact',
+    'http://x.nz/contact/',
+    'https://x.nz/contact?utm_source=a&utm_medium=b',
+    'https://x.nz/contact?fbclid=1&gclid=2#team',
+    'https://x.nz/contact?q=',
+    'https://x.nz//contact/index.html',
+    'https://X.NZ/contact;jsessionid=ABC123',
+    'https://x.nz/contact?PHPSESSID=9',
+  ];
+  for (const u of same) assert.equal(pageKey(new URL(u)), 'x.nz/contact', u);
+  assert.equal(pageKey(new URL('https://x.nz/')), 'x.nz/');
+  assert.equal(pageKey(new URL('https://x.nz/index.php')), 'x.nz/');
+  assert.equal(pageKey(new URL('https://x.nz/list?b=2&a=1')), pageKey(new URL('http://www.x.nz/list/?a=1&b=2&utm_x=1')));
+});
+
+test('pageKey() keeps params that select a different page apart', () => {
+  assert.notEqual(pageKey(new URL('https://x.nz/list?page=2')), pageKey(new URL('https://x.nz/list?page=3')));
+  assert.notEqual(pageKey(new URL('https://x.nz/list?page=2')), pageKey(new URL('https://x.nz/list')));
+  assert.notEqual(pageKey(new URL('https://x.nz/a')), pageKey(new URL('https://x.nz/b')));
+  assert.notEqual(pageKey(new URL('https://x.nz/a')), pageKey(new URL('https://y.nz/a')));
 });
 
 test('crawlable() keeps same-site HTML pages only', () => {

@@ -7,9 +7,8 @@
  */
 import fs from 'node:fs';
 import path from 'node:path';
+import { OUT_DIR, ROOT } from '../src/paths.js';
 
-const ROOT = path.resolve(import.meta.dirname, '..');
-const OUT_DIR = path.join(ROOT, 'emails');
 const min = Number(process.argv[2] ?? 1);
 const known = new Set(fs.readFileSync(path.join(ROOT, 'src', 'data', 'given-names.txt'), 'utf8').split('\n').filter(Boolean));
 

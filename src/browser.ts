@@ -10,8 +10,14 @@ export interface Fetched {
   html: string;
   url: string; // final URL after redirects
   disallowed?: boolean; // a redirect led to `url`, which robots.txt disallows, so it wasn't fetched (html is empty)
+  gone?: boolean; // the server answered 404/410: the page doesn't exist (html is empty)
+  notModified?: boolean; // 304 to a conditional request: the stored copy is still current (html is empty)
+  etag?: string; // validators of the answer (plain HTTP only), kept to revalidate the page later
+  lastModified?: string;
 }
-export type Fetcher = (url: string) => Promise<Fetched | null>;
+/** Validators of a stored copy; a fetcher that supports them asks the server whether the page changed. */
+export interface Validators { etag?: string; lastModified?: string }
+export type Fetcher = (url: string, validators?: Validators) => Promise<Fetched | null>;
 
 /** First line only: Playwright errors (e.g. browser not installed) are multi-line banners. */
 export function firstLine(e: unknown): string {

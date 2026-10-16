@@ -47,20 +47,33 @@ export function sameSite(url: URL, host: string): boolean {
   return baseHost(url.hostname) === baseHost(host);
 }
 
+// Params that never change which page is shown: campaign tracking and session ids.
+const NOISE_PARAM = /^(utm_|fbclid$|gclid$|gclsrc$|dclid$|msclkid$|yclid$|igshid$|mc_|_ga$|_gl$|_hs|hsa_|mkt_tok$|ref$|source$|phpsessid$|jsessionid$|sessionid$)/i;
+const INDEX_FILE = /\/(index|default)\.(html?|php|aspx?|jsp|cfm)$/i;
+
 /** Canonical form used for de-duplication of pages. */
 export function canonical(url: URL): string {
   const u = new URL(url.toString());
   u.hash = '';
   u.hostname = baseHost(u.hostname);
-  let p = u.pathname.replace(/\/{2,}/g, '/');
+  let p = u.pathname.replace(/\/{2,}/g, '/').replace(/;jsessionid=[^/]*/i, '').replace(INDEX_FILE, '/');
   if (p.length > 1 && p.endsWith('/')) p = p.slice(0, -1);
   u.pathname = p;
-  // drop tracking params, keep the rest (some sites use ?page=…)
-  for (const k of [...u.searchParams.keys()]) {
-    if (/^(utm_|fbclid|gclid|mc_|ref$|source$)/i.test(k)) u.searchParams.delete(k);
+  // drop tracking params and empty ones (`?q=` shows the same page as no param), keep the rest (some sites use ?page=…)
+  for (const [k, v] of [...u.searchParams]) {
+    if (NOISE_PARAM.test(k) || v === '') u.searchParams.delete(k, v);
   }
   u.searchParams.sort();
   return u.toString();
+}
+
+/**
+ * Identity of a page across a whole category: canonical() without the scheme, so http:// and https:// of one
+ * page are the same page. Two URLs differing only in tracking, session or empty params, param order, `www.`, a
+ * trailing slash, an index file or the #fragment get the same key. Params that select content (?page=2, ?id=7) don't.
+ */
+export function pageKey(url: URL): string {
+  return canonical(url).replace(/^https?:\/\//i, '');
 }
 
 /** Whether a link is worth fetching as an HTML page. */

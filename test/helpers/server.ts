@@ -7,9 +7,13 @@ export type Route =
   | string
   | { status?: number; type?: string; body?: string | Buffer; headers?: Record<string, string>; redirect?: string; delayMs?: number };
 
-/** Local site for crawler tests. Unknown paths are 404s; every request path is recorded in `hits`, with its time in `times`. */
-export async function startServer(routes: Record<string, Route>, host = '127.0.0.1'): Promise<{ url: string; hits: string[]; times: number[]; close: () => Promise<void> }> {
+/**
+ * Local site for crawler tests. Unknown paths are 404s; every request path is recorded in `hits`, with its time in
+ * `times` and its headers in `heads`. A route with an `etag` header answers 304 to a matching `If-None-Match`.
+ */
+export async function startServer(routes: Record<string, Route>, host = '127.0.0.1'): Promise<{ url: string; hits: string[]; times: number[]; heads: http.IncomingHttpHeaders[]; close: () => Promise<void> }> {
   const hits: string[] = [];
+  const heads: http.IncomingHttpHeaders[] = [];
   const times: number[] = []; // when each hit arrived, in the same order
   const send = (res: http.ServerResponse, route: Exclude<Route, string>) => {
     if (res.destroyed) return;
@@ -26,6 +30,7 @@ export async function startServer(routes: Record<string, Route>, host = '127.0.0
   const srv = http.createServer((req, res) => {
     const path = req.url ?? '/';
     hits.push(path);
+    heads.push(req.headers);
     times.push(Date.now());
     const r = routes[path];
     if (r === undefined) {
@@ -33,6 +38,12 @@ export async function startServer(routes: Record<string, Route>, host = '127.0.0
       return void res.end('not found');
     }
     const route = typeof r === 'string' ? { body: r } : r;
+    const etag = route.headers?.etag;
+    if (etag && req.headers['if-none-match'] === etag) {
+      res.statusCode = 304;
+      res.setHeader('etag', etag);
+      return void res.end();
+    }
     if (route.delayMs) setTimeout(() => send(res, route), route.delayMs);
     else send(res, route);
   });
@@ -42,6 +53,7 @@ export async function startServer(routes: Record<string, Route>, host = '127.0.0
     url: `http://${host}:${port}`,
     hits,
     times,
+    heads,
     close: () => new Promise((resolve) => { srv.closeAllConnections(); srv.close(() => resolve()); }),
   };
 }

@@ -4,7 +4,7 @@ import type { ResumeParts, SiteResult } from './crawler.js';
 import { log } from './logger.js';
 
 /**
- * Per-input-file state in emails/.cache/:
+ * Per-input-file state in results/<group>/.cache/:
  * - <base>.jsonl       one SiteResult per line, appended as sites finish (the only file the loaders read)
  * - <base>.inprogress  a scrape started and hasn't written its CSV yet; the next run resumes instead of resetting
  * - <base>.lock        PID of the run working on this file

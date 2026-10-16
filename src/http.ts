@@ -27,10 +27,13 @@ export interface HttpResult {
   body: string; // decoded text; empty for error statuses and skipped content types
   bytes: Buffer; // raw body (gzip sitemaps are binary)
   disallowed?: boolean; // a redirect led to `url`, which allowHop refused: not requested (status 0)
+  etag?: string; // validators of the answer, for revalidating the page later with a conditional request
+  lastModified?: string;
 }
 
 export interface GetOptions {
   accept?: string;
+  headers?: Record<string, string>; // extra request headers, e.g. If-None-Match to revalidate a stored page (a 304 comes back with an empty body)
   types?: RegExp; // content types worth reading; anything else is not downloaded
   signal?: AbortSignal;
   onRateLimited?: (url: string, status: number) => void; // still 429/503 after the retry; the page is skipped
@@ -220,11 +223,14 @@ async function request(url: string, opts: GetOptions): Promise<HttpResult | null
         'user-agent': UA,
         accept: opts.accept ?? 'text/html,application/xhtml+xml,*/*;q=0.8',
         'accept-language': 'en-AU,en-NZ;q=0.9,en;q=0.8',
+        ...opts.headers,
       },
     });
     notePace(new URL(url).hostname, res.status);
     const type = res.headers.get('content-type') ?? '';
-    const result = (body = '', bytes = Buffer.alloc(0)): HttpResult => ({ status: res.status, url, type, body, bytes });
+    const etag = res.headers.get('etag') ?? undefined;
+    const lastModified = res.headers.get('last-modified') ?? undefined;
+    const result = (body = '', bytes = Buffer.alloc(0)): HttpResult => ({ status: res.status, url, type, body, bytes, ...(etag ? { etag } : {}), ...(lastModified ? { lastModified } : {}) });
     // Always release an unread body: cheerio loads npm undici, which then backs global fetch, and
     // an abandoned body on a connection the server closes crashes the process (undici Parser.finish assertion).
     const release = async () => { await res.body?.cancel().catch(() => {}); };

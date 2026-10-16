@@ -1,12 +1,13 @@
 import * as cheerio from 'cheerio';
 import type { CheerioAPI } from 'cheerio';
-import { makeBrowserFetcher, firstLine, type Fetched, type Fetcher } from './browser.js';
+import { makeBrowserFetcher, firstLine, type Fetched, type Fetcher, type Validators } from './browser.js';
 import { businessName, demoteRolePrefixes, extractFromDom, isGenericTitle, looksJsRendered, type EmailSource, type Found } from './extract.js';
 import { httpGet, type FailKind } from './http.js';
 import { log } from './logger.js';
 import { allowed, blockReason, loadRobots, robotsAllow, sitemapsOf, type RobotsBlock, type RobotsRules } from './robots.js';
+import type { Mode, PageRecord, PageStore } from './pages.js';
 import { loadSitemapUrls } from './sitemap.js';
-import { baseHost, canonical, crawlable, inSection, priority, sameSite, sectionPrefix } from './urls.js';
+import { baseHost, canonical, crawlable, inSection, pageKey, priority, sameSite, sectionPrefix } from './urls.js';
 
 export { closeBrowser } from './browser.js';
 export { setHostConcurrency } from './http.js';
@@ -37,7 +38,8 @@ export interface SiteResult {
   finalUrl: string; // homepage URL after redirects
   business: string;
   emails: FoundOnPage[];
-  pages: number; // pages fetched successfully
+  pages: number; // pages fetched successfully, plus the ones taken from pages the category had already scraped
+  reused?: number; // of `pages`, those another site or an earlier run had already scraped, so none was requested
   usedBrowser: boolean;
   rateLimited?: number; // pages skipped because the server kept answering 429/503
   budgetQueued?: number; // pages still queued when the time budget ran out (v3+, or marked from the logs)
@@ -71,14 +73,16 @@ function pageTitleOf($: CheerioAPI): string | undefined {
 
 /** Per-site crawl limits. Depth is click-levels from the landing page (level 0); 0 means unlimited. */
 export interface CrawlOptions {
-  maxPages: number; // plain-HTTP page attempts (phase 1)
+  maxPages: number; // plain-HTTP page attempts (phase 1); 0 = unlimited, the time budget is the limit
   browserPages: number; // headless-browser page attempts (phase 2)
   maxDepth: number;
   budgetMs: number; // soft budget; partial results are kept when it runs out
   pageConcurrency: number; // parallel page requests within one site (HTTP phase)
+  pages?: PageStore; // every page this category has fetched: a page already in it is reused instead of requested again
+  pagesCutoff?: number; // a stored page older than this (epoch ms) is revalidated; unset = every stored page counts
 }
 
-export const DEFAULT_OPTIONS: CrawlOptions = { maxPages: 400, browserPages: 60, maxDepth: 0, budgetMs: 20 * 60_000, pageConcurrency: 3 };
+export const DEFAULT_OPTIONS: CrawlOptions = { maxPages: 0, browserPages: 60, maxDepth: 0, budgetMs: 20 * 60_000, pageConcurrency: 3 };
 export const QUICK_OPTIONS: CrawlOptions = { maxPages: 150, browserPages: 30, maxDepth: 0, budgetMs: 10 * 60_000, pageConcurrency: 3 };
 
 const PAGE_TYPES = /html|xml|text\/plain/i;
@@ -88,13 +92,18 @@ const PAGE_TYPES = /html|xml|text\/plain/i;
  * followed only where robots.txt allows; a refused hop comes back as `disallowed`, without its page.
  */
 function httpFetcher(signal?: AbortSignal, onRateLimited?: (url: string) => void, onFail?: (kind: string) => void): Fetcher {
-  return async (url) => {
-    const r = await httpGet(url, { types: PAGE_TYPES, signal, onRateLimited: () => onRateLimited?.(url), allowHop: robotsAllow, onFail });
+  return async (url, validators) => {
+    const headers: Record<string, string> = {};
+    if (validators?.etag) headers['if-none-match'] = validators.etag;
+    if (validators?.lastModified) headers['if-modified-since'] = validators.lastModified;
+    const r = await httpGet(url, { types: PAGE_TYPES, signal, headers, onRateLimited: () => onRateLimited?.(url), allowHop: robotsAllow, onFail });
     if (r?.disallowed) return { html: '', url: r.url, disallowed: true };
+    if (r?.status === 304 && Object.keys(headers).length) return { html: '', url: r.url, notModified: true };
     if (r && (r.status < 200 || r.status >= 300)) onFail?.(`http-${r.status}`);
     else if (r && !r.body) onFail?.('not-html');
+    if (r && (r.status === 404 || r.status === 410)) return { html: '', url: r.url, gone: true };
     if (!r || r.status < 200 || r.status >= 300 || !r.body) return null;
-    return { html: r.body, url: r.url };
+    return { html: r.body, url: r.url, etag: r.etag, lastModified: r.lastModified };
   };
 }
 
@@ -122,6 +131,29 @@ function collectLinks($: CheerioAPI, pageUrl: string): URL[] {
     add(/url\s*=\s*['"]?([^'"\s>]+)/i.exec($(m).attr('content') ?? '')?.[1]);
   });
   return out;
+}
+
+/**
+ * Everything a page gives, whichever site is crawling it: its emails, its department title and the links worth
+ * following (those crawlable() lets through for the page's own host, each page once).
+ */
+function makeRecord(f: Pick<Fetched, 'html' | 'url' | 'etag' | 'lastModified'>): PageRecord {
+  const $ = cheerio.load(f.html);
+  const page = new URL(f.url);
+  const keys = new Set<string>();
+  const links: string[] = [];
+  for (const l of collectLinks($, f.url)) {
+    if (!crawlable(l, page.hostname)) continue;
+    const k = pageKey(l);
+    if (keys.has(k)) continue;
+    keys.add(k);
+    links.push(l.origin === page.origin ? l.pathname + l.search : l.toString());
+  }
+  const title = pageTitleOf($);
+  return {
+    url: f.url, emails: extractFromDom($, f.html), ...(title ? { title } : {}), links, at: Date.now(),
+    ...(f.etag ? { etag: f.etag } : {}), ...(f.lastModified ? { lastModified: f.lastModified } : {}),
+  };
 }
 
 type QueueItem = { url: string; pri: number; seq: number };
@@ -169,6 +201,7 @@ class SiteCrawl {
   readonly queue = new PageQueue();
   readonly depthOf = new Map<string, number>();
   pages = 0; // successful fetches
+  reused = 0; // of `pages`, those taken from the category's earlier fetches
   attempts = 0;
   section: string | null = null;
   landingKey = '';
@@ -189,13 +222,16 @@ class SiteCrawl {
     this.depthOf.set(u.toString(), depth);
   }
 
-  /** Records the page's emails and returns its links. Parses the page once. */
-  ingest(html: string, link: string): URL[] {
-    const $ = cheerio.load(html);
-    const links = collectLinks($, link);
+  /** Records the page's emails and returns its links. */
+  ingest(rec: PageRecord): URL[] {
+    const link = rec.url;
     const u = new URL(link);
-    const title = this.section && inSection(u, this.section) && canonical(u) !== this.landingKey ? pageTitleOf($) : undefined;
-    for (const f of extractFromDom($, html)) merge(this.emails, f.email, { name: f.name, link, pageTitle: title, source: f.source, nameFrom: f.nameFrom });
+    const title = this.section && inSection(u, this.section) && canonical(u) !== this.landingKey ? rec.title : undefined;
+    for (const f of rec.emails) merge(this.emails, f.email, { name: f.name, link, pageTitle: title, source: f.source, nameFrom: f.nameFrom });
+    const links: URL[] = [];
+    for (const l of rec.links) {
+      try { links.push(new URL(l, link)); } catch { /* ignore */ }
+    }
     return links;
   }
 
@@ -208,6 +244,7 @@ class SiteCrawl {
 interface CrawlOut {
   emails: Map<string, EmailHit>;
   pages: number; // successful fetches
+  reused: number; // of `pages`, those taken from the category's earlier fetches
   home: Fetched | null;
   blocked?: RobotsBlock; // landing page kept out by robots.txt
   state?: SiteCrawl; // set once the landing page loaded
@@ -218,7 +255,14 @@ interface CrawlOut {
 /** Why a crawl's queue run ended: nothing left, time ran out, or the page cap was reached, with pages still queued. */
 type Stop = 'done' | 'time' | 'cap';
 
-interface RunLimits { deadline?: number; concurrency?: number; signal?: AbortSignal }
+interface RunLimits {
+  deadline?: number;
+  concurrency?: number;
+  signal?: AbortSignal;
+  pages?: { store: PageStore; mode: Mode; cutoff: number }; // the category's fetched pages for this phase: reused, revalidated, added to
+}
+
+const pagesOf = (opt: CrawlOptions, mode: Mode): RunLimits['pages'] => opt.pages && { store: opt.pages, mode, cutoff: opt.pagesCutoff ?? 0 };
 
 /** Fetches queued pages until the queue is empty, time runs out or the attempt cap is hit. */
 async function runQueue(c: SiteCrawl, fetcher: Fetcher, maxPages: number, opts: RunLimits): Promise<Stop> {
@@ -229,7 +273,7 @@ async function runQueue(c: SiteCrawl, fetcher: Fetcher, maxPages: number, opts: 
   const workers = Array.from({ length: opts.concurrency ?? 3 }, async () => {
     for (;;) {
       if (stopped()) { outOfTime = true; return; }
-      if (c.attempts >= maxPages) { capped = true; return; }
+      if (maxPages > 0 && c.attempts >= maxPages) { capped = true; return; }
       const item = c.queue.pop();
       if (!item) {
         // other workers may still add links; wait briefly if any are in flight
@@ -245,27 +289,53 @@ async function runQueue(c: SiteCrawl, fetcher: Fetcher, maxPages: number, opts: 
           log.debug({ url: item.url }, "skipping a page that its host's robots.txt disallows");
           continue;
         }
-        const r = await fetcher(item.url);
-        if (!r) {
+        // Another site of the category may already have this page, or be fetching it right now (see PageStore.load).
+        // A reused page still counts toward --max-pages, so a site is crawled exactly as it would be without the store.
+        let skipped = false;
+        const key = pageKey(new URL(item.url));
+        const fetchRecord = async (stale?: PageRecord): Promise<PageRecord | null> => {
+          const validators: Validators | undefined = stale && (stale.etag || stale.lastModified) ? { etag: stale.etag, lastModified: stale.lastModified } : undefined;
+          const r = await fetcher(item.url, validators);
+          if (!r) return null;
+          if (r.gone) {
+            opts.pages?.store.markGone(opts.pages.mode, key);
+            return null;
+          }
+          if (r.notModified && stale) return { ...stale, at: Date.now() }; // revalidated: the stored copy is current
+          if (r.url !== item.url) {
+            // a redirect: don't fetch the target again, and don't take emails from another site or a disallowed page
+            c.seen.add(canonical(new URL(r.url)));
+            if (r.disallowed || !sameSite(new URL(r.url), c.host) || !(await c.allows(r.url))) {
+              log.debug({ url: item.url, to: r.url }, 'skipping a redirect off the site or into a disallowed path');
+              skipped = true;
+              return null;
+            }
+          }
+          return makeRecord(r);
+        };
+        const got = opts.pages
+          ? await opts.pages.store.load(opts.pages.mode, key, opts.pages.cutoff, fetchRecord)
+          : await fetchRecord().then((rec) => (rec ? { rec, reused: false } : null));
+        if (got === 'gone') {
+          log.debug({ url: item.url }, 'skipping a page that is gone (404/410)');
+          continue;
+        }
+        if (!got) {
           // cut off by the hard stop: back into the queue, so it is saved for a later run
-          if (opts.signal?.aborted) {
+          if (opts.signal?.aborted && !skipped) {
             c.queue.push(item.url, item.pri);
             c.attempts--;
           }
           continue;
         }
-        const final = new URL(r.url);
-        if (r.url !== item.url) {
-          // a redirect: don't fetch the target again, and don't take emails from another site or a disallowed page
-          c.seen.add(canonical(final));
-          if (r.disallowed || !sameSite(final, c.host) || !(await c.allows(r.url))) {
-            log.debug({ url: item.url, to: r.url }, 'skipping a redirect off the site or into a disallowed path');
-            continue;
-          }
+        if (got.rec.url !== item.url) c.seen.add(canonical(new URL(got.rec.url)));
+        if (got.reused) {
+          c.reused++;
+          log.debug({ url: item.url }, 'reusing a page this category already scraped');
         }
         c.pages++;
         const d = (c.depthOf.get(item.url) ?? 1) + 1;
-        for (const l of c.ingest(r.html, r.url)) c.enqueue(l, d);
+        for (const l of c.ingest(got.rec)) c.enqueue(l, d);
       } catch (err) {
         // one bad page must never take the whole site down
         log.debug({ url: item.url, err }, 'page processing failed');
@@ -299,21 +369,21 @@ async function crawl(
 
   if (!allowed(robots, start)) {
     log.info({ url: start }, `robots.txt disallows ${start}`);
-    return { emails: none, pages: 0, home: null, blocked: blockReason(robots) };
+    return { emails: none, pages: 0, reused: 0, home: null, blocked: blockReason(robots) };
   }
 
   // homepage first (sequential so we know the final host)
   const first = await fetcher(start);
-  if (!first) {
+  if (!first || first.gone) {
     log.debug({ url: start }, 'start URL unreachable');
-    return { emails: none, pages: 0, home: null };
+    return { emails: none, pages: 0, reused: 0, home: null };
   }
   const landing = new URL(first.url);
   // A redirect to another server means that server's robots.txt applies; a redirect may also land on a disallowed path.
   if (landing.origin !== new URL(start).origin) robots = await loadRobots(landing.origin);
   if (first.disallowed || !allowed(robots, first.url)) {
     log.info({ url: first.url, start }, `robots.txt disallows ${first.url} (redirected from ${start})`);
-    return { emails: none, pages: first.disallowed ? 0 : 1, home: first, blocked: blockReason(robots) };
+    return { emails: none, pages: first.disallowed ? 0 : 1, reused: 0, home: first, blocked: blockReason(robots) };
   }
   const c = new SiteCrawl(landing.hostname, landing.origin, robots, opts.maxDepth ?? 0);
   c.attempts = 1;
@@ -324,12 +394,18 @@ async function crawl(
   c.seen.add(canonical(new URL(start)));
 
   try {
-    for (const l of c.ingest(first.html, first.url)) c.enqueue(l, 1);
+    // The landing page is always requested (its business name and look are read from the HTML), but other sites can reuse its data.
+    const rec = makeRecord(first);
+    if (opts.pages && sameSite(landing, new URL(start).hostname)) {
+      for (const u of new Set([start, first.url])) opts.pages.store.put(opts.pages.mode, pageKey(new URL(u)), rec, opts.pages.cutoff);
+    }
+    for (const l of c.ingest(rec)) c.enqueue(l, 1);
   } catch (err) {
     log.debug({ url: first.url, err }, 'page processing failed');
   }
   if (opts.useSitemap && !stopped()) {
-    const sm = await loadSitemapUrls(landing.origin, sitemapsOf(robots), { deadline: opts.deadline, signal: opts.signal });
+    const load = () => loadSitemapUrls(landing.origin, sitemapsOf(robots), { deadline: opts.deadline, signal: opts.signal });
+    const sm = opts.pages ? await opts.pages.store.sitemap(landing.origin, load, () => !stopped()) : await load();
     for (const s of sm) {
       try {
         const u = new URL(s);
@@ -339,7 +415,7 @@ async function crawl(
   }
 
   const stop = await runQueue(c, fetcher, maxPages, opts);
-  return { emails: c.emails, pages: c.pages, home: first, state: c, outOfTime: stop === 'time', stop };
+  return { emails: c.emails, pages: c.pages, reused: c.reused, home: first, state: c, outOfTime: stop === 'time', stop };
 }
 
 interface Leftover {
@@ -401,7 +477,7 @@ async function browserPhase(starts: string[], opt: CrawlOptions, deadline: numbe
     let out: CrawlOut | null = null;
     for (const start of starts) {
       if (signal?.aborted) break;
-      out = await crawl(start, fetcher, opt.browserPages, { concurrency: 2, deadline, maxDepth: opt.maxDepth, signal });
+      out = await crawl(start, fetcher, opt.browserPages, { concurrency: 2, deadline, maxDepth: opt.maxDepth, signal, pages: pagesOf(opt, 'b') });
       if (out.blocked || out.home) break;
     }
     return out;
@@ -434,6 +510,7 @@ export async function scrapeSite(site: string, options: Partial<CrawlOptions> = 
     usedBrowser: false,
   };
   const all = new Map<string, EmailHit>();
+  let reused = 0;
   let homeHtml: string | null = null;
   let homeHost = new URL(site).hostname;
 
@@ -448,7 +525,7 @@ export async function scrapeSite(site: string, options: Partial<CrawlOptions> = 
   for (const start of candidateStarts(site)) {
     if (signal?.aborted) break;
     lastFail = '';
-    const out = await crawl(start, fetchHttp, opt.maxPages, { useSitemap: true, deadline, maxDepth: opt.maxDepth, concurrency: opt.pageConcurrency, signal });
+    const out = await crawl(start, fetchHttp, opt.maxPages, { useSitemap: true, deadline, maxDepth: opt.maxDepth, concurrency: opt.pageConcurrency, signal, pages: pagesOf(opt, 'h') });
     if (!out.home && !out.blocked) fails.push(lastFail || 'network');
     if (out.blocked) {
       result.error = out.blocked;
@@ -462,6 +539,7 @@ export async function scrapeSite(site: string, options: Partial<CrawlOptions> = 
     homeHost = new URL(httpOut.home.url).hostname;
     result.finalUrl = httpOut.home.url;
     result.pages += httpOut.pages;
+    reused += httpOut.reused;
     for (const [e, h] of httpOut.emails) all.set(e, h);
   }
   const left = httpOut?.state ? leftover(httpOut.state, httpOut.stop ?? 'done', limited) : undefined;
@@ -477,6 +555,7 @@ export async function scrapeSite(site: string, options: Partial<CrawlOptions> = 
   const assemble = (owed: ResumeState['browser']): SiteResult => {
     const r: SiteResult = { ...result };
     if (rateLimited) r.rateLimited = rateLimited;
+    if (reused) r.reused = reused;
     const resume = resumeState(left, httpOut?.state?.attempts ?? 0, owed);
     if (resume) r.resume = resume;
     if (signal?.aborted) r.error ??= 'timeout';
@@ -506,6 +585,7 @@ export async function scrapeSite(site: string, options: Partial<CrawlOptions> = 
       } else if (out?.home) {
         result.usedBrowser = true;
         result.pages += out.pages;
+        reused += out.reused;
         homeHtml ??= out.home.html;
         if (!httpOut?.home) {
           homeHost = new URL(out.home.url).hostname;
@@ -562,7 +642,7 @@ export async function resumeSite(prev: SiteResult, parts: ResumeParts, options: 
   let takeQueued = saved.queued.length > 0 && (saved.capped ? !!parts.capped : parts.budget);
   let takeLimited = parts.limited && saved.limited.length > 0;
   // A rate-limited page's failed attempt is given back when it is tried again.
-  if ((takeQueued || takeLimited) && saved.attempts - (takeLimited ? saved.limited.length : 0) >= opt.maxPages) {
+  if (opt.maxPages > 0 && (takeQueued || takeLimited) && saved.attempts - (takeLimited ? saved.limited.length : 0) >= opt.maxPages) {
     log.info({ attempts: saved.attempts, maxPages: opt.maxPages }, `the page cap is used up (${saved.attempts} of --max-pages=${opt.maxPages}); raise --max-pages to continue this site`);
     takeQueued = takeLimited = false;
   }
@@ -580,7 +660,7 @@ export async function resumeSite(prev: SiteResult, parts: ResumeParts, options: 
   let stop: Stop = 'done';
   if (c.queue.size) {
     const fetchHttp = httpFetcher(signal, (url) => { rateLimited++; limited.add(url); });
-    stop = await runQueue(c, fetchHttp, opt.maxPages, { deadline, concurrency: opt.pageConcurrency, signal });
+    stop = await runQueue(c, fetchHttp, opt.maxPages, { deadline, concurrency: opt.pageConcurrency, signal, pages: pagesOf(opt, 'h') });
   }
   const outOfTime = stop === 'time';
   const left = leftover(c, stop, limited, { queued: takeQueued ? [] : saved.queued, limited: takeLimited ? [] : saved.limited, capped: saved.capped });
@@ -588,6 +668,7 @@ export async function resumeSite(prev: SiteResult, parts: ResumeParts, options: 
   const all = new Map(prev.emails.map((e) => [e.email, toHit(e)] as const));
   for (const [e, h] of c.emails) merge(all, e, h);
   let pages = prev.pages + c.pages;
+  let reused = (prev.reused ?? 0) + c.reused;
   let usedBrowser = prev.usedBrowser;
   let error = prev.error === 'timeout' ? undefined : prev.error;
   let browserQueued = 0;
@@ -597,6 +678,7 @@ export async function resumeSite(prev: SiteResult, parts: ResumeParts, options: 
     const result: SiteResult = { v: CACHE_VERSION, site: prev.site, finalUrl: prev.finalUrl, business: prev.business, emails: [...all].map(toFound), pages, usedBrowser };
     const limitedTotal = (takeLimited ? 0 : prev.rateLimited ?? 0) + rateLimited;
     if (limitedTotal) result.rateLimited = limitedTotal;
+    if (reused) result.reused = reused;
     // Informational counts: pages still queued, whether carried over or left by this pass.
     const carried = takeQueued ? 0 : saved.queued.length ? (saved.capped ? prev.capQueued : prev.budgetQueued) ?? saved.queued.length : 0;
     const queued = left.total - (takeQueued ? 0 : saved.queued.length) + carried;
@@ -625,6 +707,7 @@ export async function resumeSite(prev: SiteResult, parts: ResumeParts, options: 
       } else if (out?.home) {
         usedBrowser = true;
         pages += out.pages;
+        reused += out.reused;
         for (const [e, h] of out.emails) merge(all, e, h);
         if (out.outOfTime) {
           owed = saved.browser;
@@ -653,6 +736,7 @@ export function mergeResults(prev: SiteResult, next: SiteResult): SiteResult {
     v: next.v,
     emails: [...prev.emails, ...added],
     pages: reached ? next.pages : prev.pages,
+    reused: reached ? next.reused : prev.reused,
     usedBrowser: prev.usedBrowser || next.usedBrowser,
     error: reached ? next.error : prev.error,
     rateLimited: next.rateLimited,
@@ -660,7 +744,7 @@ export function mergeResults(prev: SiteResult, next: SiteResult): SiteResult {
     capQueued: next.capQueued,
     resume: next.resume,
   };
-  for (const k of ['v', 'error', 'rateLimited', 'budgetQueued', 'capQueued', 'resume'] as const) if (out[k] === undefined) delete out[k];
+  for (const k of ['v', 'error', 'reused', 'rateLimited', 'budgetQueued', 'capQueued', 'resume'] as const) if (out[k] === undefined) delete out[k];
   demoteRolePrefixes(out.emails);
   return out;
 }
