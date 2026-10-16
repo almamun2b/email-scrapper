@@ -11,7 +11,7 @@ import type { SiteResult } from '../src/crawler.js';
 import { readSites } from '../src/input.js';
 import { assignRows, recheckSite, safeCell, uniqueLabel, uniqueRows } from '../src/output.js';
 import { categoryOf, fileLayout, findInputs, findOutputs, groupOf } from '../src/paths.js';
-import { previewFile, processFile, staleState } from '../src/run.js';
+import { previewFile, processFile, staleState, writeUnique } from '../src/run.js';
 import { DEFAULT_OPTIONS } from '../src/crawler.js';
 
 const tmp = () => fs.mkdtempSync(path.join(os.tmpdir(), 'scraper-test-'));
@@ -344,6 +344,31 @@ test('uniqueRows keeps each email once across files, first file wins, case-insen
   assert.equal(read, 6);
   assert.deepEqual(rows.map((r) => [r[0], r[1]]), [['A', 'x@a.com'], ['B', 'y@a.com'], ['C', 'z@b.com']]);
   assert.deepEqual(Object.fromEntries(overlaps), { 'au.b ← au.a': 1, 'au.c ← au.a': 1, 'au.c ← au.b': 1 });
+});
+
+test('writeUnique adds shared/ rows after every main CSV, so an owner\'s row wins', () => {
+  const out = path.join(tmp(), 'emails');
+  const a = fileLayout('dealers', 'a', out);
+  const b = fileLayout('dealers', 'b', out);
+  const put = (file: string, text: string) => { fs.mkdirSync(path.dirname(file), { recursive: true }); fs.writeFileSync(file, text); };
+  put(a.outFile, 'name,email,website,link\nA,sales@a.com.au,https://a.com.au/,l\n');
+  put(a.sharedFile, 'name,email,website,link\nX,help@finance.com.au,https://a.com.au/,l\nY,info@b.com.au,https://a.com.au/,l\n');
+  put(b.outFile, 'name,email,website,link\nB,info@b.com.au,https://b.com.au/,l\n');
+  const target = path.join(a.uniqueDir, 'dealers.csv');
+  writeUnique([{ id: 'a', file: a.outFile, shared: a.sharedFile }, { id: 'b', file: b.outFile, shared: b.sharedFile }], 'dealers', target, a.logDir);
+  const rows = parse(fs.readFileSync(target, 'utf8'), { columns: true }) as Record<string, string>[];
+  assert.deepEqual(rows.map((r) => [r.name, r.email, r.website]), [
+    ['A', 'sales@a.com.au', 'https://a.com.au/'],
+    ['B', 'info@b.com.au', 'https://b.com.au/'],
+    ['X', 'help@finance.com.au', 'https://a.com.au/'],
+  ]);
+  const summary = fs.readFileSync(path.join(a.logDir, 'unique.dealers.log'), 'utf8');
+  assert.match(summary, /Shared {3}: 2 row\(s\) from shared\/ \(a 2\), 1 added/);
+  assert.match(summary, /Rows {5}: 4 read, 1 duplicate\(s\) removed/);
+
+  fs.rmSync(path.dirname(a.sharedFile), { recursive: true });
+  writeUnique([{ id: 'a', file: a.outFile, shared: a.sharedFile }, { id: 'b', file: b.outFile, shared: b.sharedFile }], 'dealers', target, a.logDir);
+  assert.deepEqual((parse(fs.readFileSync(target, 'utf8'), { columns: true }) as Record<string, string>[]).map((r) => r.email), ['sales@a.com.au', 'info@b.com.au']);
 });
 
 test('uniqueLabel names the combined file after the shared prefix', () => {

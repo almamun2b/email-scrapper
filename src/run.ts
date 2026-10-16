@@ -267,29 +267,40 @@ export async function processFile(file: string, layout: FileLayout, opts: RunOpt
   }
 }
 
+function readRows(file: string): Row[] {
+  const rows = parse(fs.readFileSync(file), { columns: true, skip_empty_lines: true, bom: true }) as Record<string, string>[];
+  return rows.filter((r) => r.email).map((r) => [r.name ?? '', r.email, r.website ?? '', r.link ?? '']);
+}
+
 /**
  * --unique: every email once across the given output CSVs, written to `outFile`. Reads finished outputs only;
  * per-file CSVs and caches are left alone and nothing is scraped. `label` names the combined file and its log.
+ * Each input's shared/ file (emails on many sites that don't own them) is read after all the main CSVs, so an
+ * email another list credits to its owner keeps that row.
  */
-function writeUnique(inputs: { id: string; file: string }[], label: string, outFile: string, logDir: string): void {
+export function writeUnique(inputs: { id: string; file: string; shared?: string }[], label: string, outFile: string, logDir: string): void {
   const startedAt = Date.now();
   const files: { base: string; rows: Row[] }[] = [];
+  const shared: { base: string; rows: Row[] }[] = [];
   const missing: string[] = [];
-  for (const { id, file } of inputs) {
+  for (const { id, file, shared: sharedFile } of inputs) {
     if (!fs.existsSync(file)) { missing.push(id); continue; }
-    const rows = parse(fs.readFileSync(file), { columns: true, skip_empty_lines: true, bom: true }) as Record<string, string>[];
-    files.push({ base: id, rows: rows.filter((r) => r.email).map((r) => [r.name ?? '', r.email, r.website ?? '', r.link ?? '']) });
+    files.push({ base: id, rows: readRows(file) });
+    if (sharedFile && fs.existsSync(sharedFile)) shared.push({ base: `${id} shared`, rows: readRows(sharedFile) });
   }
   if (missing.length) log.warn({ missing }, `--unique: no output yet for ${missing.join(', ')}; skipped`);
   if (!files.length) { log.warn(`--unique ${label}: no output CSVs to combine`); return; }
 
-  const { rows, read, overlaps } = uniqueRows(files);
+  const { rows, read, overlaps } = uniqueRows([...files, ...shared]);
   writeCsv(outFile, rows);
 
   const top = [...overlaps].sort((a, b) => b[1] - a[1]).slice(0, 5);
+  const sharedRead = shared.reduce((n, f) => n + f.rows.length, 0);
+  const sharedAdded = sharedRead ? rows.length - uniqueRows(files).rows.length : 0;
   const text = [
     `=== unique ${label} — ${new Date(startedAt).toISOString()} (run ${runId}) ===`,
     `  Files    : ${files.length} (${files.map((f) => `${f.base} ${f.rows.length}`).join(', ')})`,
+    ...(sharedRead ? [`  Shared   : ${sharedRead} row(s) from shared/ (${shared.filter((f) => f.rows.length).map((f) => `${f.base.replace(/ shared$/, '')} ${f.rows.length}`).join(', ')}), ${sharedAdded} added`] : []),
     `  Rows     : ${read} read, ${read - rows.length} duplicate(s) removed`,
     `  Emails   : ${rows.length} unique -> ${path.relative(ROOT, outFile)}`,
     ...(top.length ? [`  Overlap  : ${top.map(([k, n]) => `${k} ${n}`).join('; ')}`] : []),
@@ -297,7 +308,7 @@ function writeUnique(inputs: { id: string; file: string }[], label: string, outF
   ].join('\n');
   fs.mkdirSync(logDir, { recursive: true });
   fs.appendFileSync(path.join(logDir, `unique.${label}.log`), text + '\n');
-  log.info({ output: path.relative(ROOT, outFile), files: files.length, rowsRead: read, uniqueEmails: rows.length }, '\n' + text);
+  log.info({ output: path.relative(ROOT, outFile), files: files.length, rowsRead: read, sharedRows: sharedRead, uniqueEmails: rows.length }, '\n' + text);
 }
 
 /**
@@ -309,14 +320,19 @@ export function runUnique(fileArgs: string[]): void {
   if (!fileArgs.length) {
     for (const [group, csvs] of findOutputs(OUT_DIR)) {
       const l = fileLayout(group, group);
-      writeUnique(csvs.map((file) => ({ id: path.basename(file, '.csv'), file })), group, path.join(l.uniqueDir, `${group}.csv`), l.logDir);
+      const inputs = csvs.map((file) => {
+        const base = path.basename(file, '.csv');
+        return { id: base, file, shared: fileLayout(group, base).sharedFile };
+      });
+      writeUnique(inputs, group, path.join(l.uniqueDir, `${group}.csv`), l.logDir);
     }
     return;
   }
   const items = fileArgs.map((f) => {
     const group = groupOf(f);
     const base = path.basename(f, path.extname(f));
-    return { group, id: `${group}/${base}`, file: fileLayout(group, base).outFile };
+    const l = fileLayout(group, base);
+    return { group, id: `${group}/${base}`, file: l.outFile, shared: l.sharedFile };
   });
   const uniq = [...new Map(items.map((i) => [i.id, i])).values()].sort((a, b) => a.id.localeCompare(b.id));
   const groups = new Set(uniq.map((i) => i.group));
