@@ -22,7 +22,7 @@ Crawl limits (defaults: deep crawl)
   --page-concurrency=N       page requests in parallel within one site (3)
   --host-concurrency=N       requests in parallel to one server, across all sites (3)
 
-Pages already scraped (kept per category in emails/<category>/.cache/.pages; a page is never requested twice)
+Pages already scraped (kept per category in results/<category>/.cache/.pages; a page is never requested twice)
   --revalidate[=DAYS]        ask again for stored pages older than DAYS days (30); with no number, for every stored page once
 
 Re-running and retrying (they reuse the cache and can be combined)
@@ -35,11 +35,11 @@ Re-running and retrying (they reuse the cache and can be combined)
 
 Outputs without crawling
   --summary-only             rebuild CSVs and summaries from the cache with the current rules
-  --unique                   each email once per category -> emails/<category>/unique/<category>.csv
+  --unique                   each email once per category -> results/<category>/emails/unique/<category>.csv
   --check-mx                 drop emails whose domain can't receive mail (DNS lookups only)
 
 Other
-  --dry-run                  show what the command would do; writes nothing under emails/
+  --dry-run                  show what the command would do; writes nothing under results/
   --log-level=LEVEL          file log level: trace, debug, info, warn, error, fatal, silent (info)
   --help, -h                 this text
 

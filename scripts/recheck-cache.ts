@@ -20,7 +20,7 @@ const showAll = args.includes('--all');
 const only = args.filter((a) => !a.startsWith('--'));
 const SAMPLE = 25;
 
-// emails/<group>/.cache/<base>.jsonl; `id` is <group>/<base>
+// results/<group>/.cache/<base>.jsonl; `id` is <group>/<base>
 const files = fs.readdirSync(OUT_DIR, { withFileTypes: true })
   .filter((d) => d.isDirectory() && fs.existsSync(path.join(OUT_DIR, d.name, '.cache')))
   .flatMap((d) => fs.readdirSync(path.join(OUT_DIR, d.name, '.cache'))
@@ -53,7 +53,6 @@ const nameLost: string[] = [];
 const nameChanged: string[] = [];
 const nameGained: string[] = [];
 const moved: string[] = [];
-const shared: string[] = [];
 const named: string[] = [];
 
 for (const { group, base, file, id } of files) {
@@ -74,7 +73,7 @@ for (const { group, base, file, id } of files) {
     }
   }
 
-  // Row assignment for the whole file: which site an email is credited to, and what goes to shared/.
+  // Row assignment for the whole file: which site an email is credited to.
   const input = inputOf(group, base);
   const sites = input?.sites.filter((s) => done.has(s)) ?? [...done.keys()];
   const checked = new Map([...done].map(([s, r]) => [s, recheckSite(r)]));
@@ -84,7 +83,6 @@ for (const { group, base, file, id } of files) {
     const was = before.get(email);
     if (was && was !== site) moved.push(`${id}: ${email}  ${new URL(was).hostname} → ${new URL(site).hostname}`);
   }
-  for (const [, email] of out.shared) shared.push(`${id}: ${email} (on ${out.sharedOn.get(email)} sites)`);
   if (out.kinds.input) named.push(`${id}: ${out.kinds.input} row(s) now named from the input's name column`);
 }
 
@@ -100,5 +98,4 @@ show('Person names removed', nameLost);
 show('Person names changed', nameChanged);
 show('Person names added', nameGained);
 show('Emails credited to a different site', moved);
-show('Emails moved to shared/', shared);
 show('Input names used', named);

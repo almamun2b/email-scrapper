@@ -9,7 +9,7 @@ import { readSites } from './input.js';
 import { PageStore } from './pages.js';
 import { undeliverable } from './mx.js';
 import { log, runId, withLogContext } from './logger.js';
-import { assignRows, recheckSite, SHARED_MIN_SITES, uniqueLabel, uniqueRows, type Assigned, type Row } from './output.js';
+import { assignRows, recheckSite, uniqueLabel, uniqueRows, type Assigned, type Row } from './output.js';
 import { fileLayout, findOutputs, groupOf, OUT_DIR, ROOT, type FileLayout } from './paths.js';
 import { baseHost } from './urls.js';
 
@@ -27,7 +27,7 @@ export interface RunOptions extends CrawlOptions {
 const stores = new Map<string, { store: PageStore; release: () => void }>();
 
 /**
- * The category's page store (emails/<category>/.cache/.pages), opened once per run so all its lists share it.
+ * The category's page store (results/<category>/.cache/.pages), opened once per run so all its lists share it.
  * Takes the category lock, because two runs appending to one store would corrupt its index; throws LockedError
  * if another live run holds it.
  */
@@ -104,14 +104,14 @@ function reasonCode(error: string): string {
   return REASON_CODES.has(error) ? error : 'other';
 }
 
-/** Human-readable summary of one processed CSV; printed and appended to emails/<group>/logs/<name>.log. */
+/** Human-readable summary of one processed CSV; printed and appended to results/<group>/logs/<name>.log. */
 export function describe(o: RunOptions): string {
   return `${o.maxPages || 'unlimited'} pages, ${o.browserPages} browser pages, depth ${o.maxDepth || 'unlimited'}, ${o.budgetMs / 60_000} min/site, ${o.concurrency} sites in parallel, ${o.pageConcurrency} page requests per site, ${o.hostConcurrency} per server, stored pages revalidated after ${o.revalidateDays} days${o.checkMx ? ', MX check' : ''}`;
 }
 
 const COLUMNS = ['name', 'email', 'website', 'link'];
 
-/** Writes a CSV atomically; folders under emails/ are created readable by their owner only (personal data). */
+/** Writes a CSV atomically; folders under results/ are created readable by their owner only (personal data). */
 function writeCsv(file: string, rows: Row[]): void {
   fs.mkdirSync(path.dirname(file), { recursive: true, mode: 0o700 });
   writeFileAtomic(file, stringify(rows, { header: true, columns: COLUMNS }));
@@ -151,10 +151,6 @@ function writeSummary(layout: FileLayout, sites: string[], done: Map<string, Sit
     `  Emails   : ${uniqueEmails} unique (${k.person} person name, ${k.department} department page title, ${k.input} input name, ${k.business} business name)`,
     `  Crawl    : ${fetched} pages fetched${reused ? ` + ${reused} reused (already scraped in this category, not requested again)` : ''} | headless browser used on ${results.filter((r) => r.usedBrowser).length} sites`,
   ];
-  if (out.shared.length) {
-    const top = [...out.sharedOn].sort((a, b) => b[1] - a[1]).slice(0, 5).map(([e, n]) => `${e} ${n}`);
-    lines.push(`  Shared   : ${out.shared.length} email(s) found on ${SHARED_MIN_SITES}+ sites that don't own them -> ${path.relative(layout.groupDir, layout.sharedFile)} (${top.join(', ')})`);
-  }
   if (mxDropped) {
     const list = mxDropped.slice(0, 5).join(', ') + (mxDropped.length > 5 ? ', …' : '');
     lines.push(`  MX check : ${mxDropped.length ? `${mxDropped.length} email(s) dropped, their domain can't receive mail: ${list}` : "every email's domain can receive mail"}`);
@@ -188,7 +184,7 @@ function writeSummary(layout: FileLayout, sites: string[], done: Map<string, Sit
   const text = lines.join('\n') + '\n';
   fs.mkdirSync(layout.logDir, { recursive: true });
   fs.appendFileSync(path.join(layout.logDir, `${layout.base}.log`), text + '\n');
-  log.info({ sites: sites.length, withEmails: withEmails.length, noEmails: noEmails.length, failed: failed.length, uniqueEmails, shared: out.shared.length, failures: Object.fromEntries(reasons) }, '\n' + text);
+  log.info({ sites: sites.length, withEmails: withEmails.length, noEmails: noEmails.length, failed: failed.length, uniqueEmails, failures: Object.fromEntries(reasons) }, '\n' + text);
 }
 
 /**
@@ -300,7 +296,6 @@ export async function processFile(file: string, layout: FileLayout, opts: RunOpt
     const assigned = assignRows(sites, checked, input.names);
     const { rows } = assigned;
     writeCsv(outFile, rows);
-    if (assigned.shared.length || fs.existsSync(layout.sharedFile)) writeCsv(layout.sharedFile, assigned.shared);
     const withEmails = sites.filter((s) => (checked.get(s)?.emails.length ?? 0) > 0).length;
     const failed = sites.filter((s) => { const r = checked.get(s); return r?.error && !r.emails.length; }).length;
     log.info({ output: rel(outFile), emails: rows.length, withEmails, failed }, `=> ${rel(outFile)}: ${rows.length} emails from ${withEmails}/${sites.length} sites (${failed} failed/unreachable)`);
@@ -321,32 +316,25 @@ function readRows(file: string): Row[] {
 /**
  * --unique: every email once across the given output CSVs, written to `outFile`. Reads finished outputs only;
  * per-file CSVs and caches are left alone and nothing is scraped. `label` names the combined file and its log.
- * Each input's shared/ file (emails on many sites that don't own them) is read after all the main CSVs, so an
- * email another list credits to its owner keeps that row.
  */
-export function writeUnique(inputs: { id: string; file: string; shared?: string }[], label: string, outFile: string, logDir: string): void {
+export function writeUnique(inputs: { id: string; file: string }[], label: string, outFile: string, logDir: string): void {
   const startedAt = Date.now();
   const files: { base: string; rows: Row[] }[] = [];
-  const shared: { base: string; rows: Row[] }[] = [];
   const missing: string[] = [];
-  for (const { id, file, shared: sharedFile } of inputs) {
+  for (const { id, file } of inputs) {
     if (!fs.existsSync(file)) { missing.push(id); continue; }
     files.push({ base: id, rows: readRows(file) });
-    if (sharedFile && fs.existsSync(sharedFile)) shared.push({ base: `${id} shared`, rows: readRows(sharedFile) });
   }
   if (missing.length) log.warn({ missing }, `--unique: no output yet for ${missing.join(', ')}; skipped`);
   if (!files.length) { log.warn(`--unique ${label}: no output CSVs to combine`); return; }
 
-  const { rows, read, overlaps } = uniqueRows([...files, ...shared]);
+  const { rows, read, overlaps } = uniqueRows(files);
   writeCsv(outFile, rows);
 
   const top = [...overlaps].sort((a, b) => b[1] - a[1]).slice(0, 5);
-  const sharedRead = shared.reduce((n, f) => n + f.rows.length, 0);
-  const sharedAdded = sharedRead ? rows.length - uniqueRows(files).rows.length : 0;
   const text = [
     `=== unique ${label} — ${new Date(startedAt).toISOString()} (run ${runId}) ===`,
     `  Files    : ${files.length} (${files.map((f) => `${f.base} ${f.rows.length}`).join(', ')})`,
-    ...(sharedRead ? [`  Shared   : ${sharedRead} row(s) from shared/ (${shared.filter((f) => f.rows.length).map((f) => `${f.base.replace(/ shared$/, '')} ${f.rows.length}`).join(', ')}), ${sharedAdded} added`] : []),
     `  Rows     : ${read} read, ${read - rows.length} duplicate(s) removed`,
     `  Emails   : ${rows.length} unique -> ${path.relative(ROOT, outFile)}`,
     ...(top.length ? [`  Overlap  : ${top.map(([k, n]) => `${k} ${n}`).join('; ')}`] : []),
@@ -354,22 +342,19 @@ export function writeUnique(inputs: { id: string; file: string; shared?: string 
   ].join('\n');
   fs.mkdirSync(logDir, { recursive: true });
   fs.appendFileSync(path.join(logDir, `unique.${label}.log`), text + '\n');
-  log.info({ output: path.relative(ROOT, outFile), files: files.length, rowsRead: read, sharedRows: sharedRead, uniqueEmails: rows.length }, '\n' + text);
+  log.info({ output: path.relative(ROOT, outFile), files: files.length, rowsRead: read, uniqueEmails: rows.length }, '\n' + text);
 }
 
 /**
- * --unique with no files: one combined list per group folder, written inside it (emails/<group>/unique/<group>.csv).
- * With files: the files' own group if they share one (emails/<group>/unique/<label>.csv), else a cross-group list
- * in emails/unique/, the only output that lives outside a group folder.
+ * --unique with no files: one combined list per group folder, written inside it (results/<group>/emails/unique/<group>.csv).
+ * With files: the files' own group if they share one (results/<group>/emails/unique/<label>.csv), else a cross-group
+ * list in results/unique/, the only output that lives outside a group folder.
  */
 export function runUnique(fileArgs: string[]): void {
   if (!fileArgs.length) {
     for (const [group, csvs] of findOutputs(OUT_DIR)) {
       const l = fileLayout(group, group);
-      const inputs = csvs.map((file) => {
-        const base = path.basename(file, '.csv');
-        return { id: base, file, shared: fileLayout(group, base).sharedFile };
-      });
+      const inputs = csvs.map((file) => ({ id: path.basename(file, '.csv'), file }));
       writeUnique(inputs, group, path.join(l.uniqueDir, `${group}.csv`), l.logDir);
     }
     return;
@@ -377,8 +362,7 @@ export function runUnique(fileArgs: string[]): void {
   const items = fileArgs.map((f) => {
     const group = groupOf(f);
     const base = path.basename(f, path.extname(f));
-    const l = fileLayout(group, base);
-    return { group, id: `${group}/${base}`, file: l.outFile, shared: l.sharedFile };
+    return { group, id: `${group}/${base}`, file: fileLayout(group, base).outFile };
   });
   const uniq = [...new Map(items.map((i) => [i.id, i])).values()].sort((a, b) => a.id.localeCompare(b.id));
   const groups = new Set(uniq.map((i) => i.group));

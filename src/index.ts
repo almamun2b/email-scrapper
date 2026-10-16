@@ -73,7 +73,7 @@ async function main() {
   const categories = new Set(targets.map((t) => categoryOf(t.file)).filter(Boolean));
   for (const { file, layout } of targets) {
     if (!categoryOf(file) && categories.has(layout.group)) {
-      log.warn({ input: path.relative(ROOT, file) }, `${path.basename(file)} has no category but shares emails/${layout.group}/ with the "${layout.group}" category`);
+      log.warn({ input: path.relative(ROOT, file) }, `${path.basename(file)} has no category but shares results/${layout.group}/ with the "${layout.group}" category`);
     }
   }
 

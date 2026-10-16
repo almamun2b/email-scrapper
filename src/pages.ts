@@ -25,7 +25,7 @@ const GONE_JSON = '{"gone":1}';
 const CHUNK = 8 << 20;
 
 /**
- * Every page a category has fetched, kept in `emails/<category>/.cache/.pages` so all its lists and later
+ * Every page a category has fetched, kept in `results/<category>/.cache/.pages` so all its lists and later
  * runs reuse them. A line is `<mode><key>\t<at>\t<json>`: mode `h` for pages fetched with plain HTTP, `b` for
  * the browser (it renders what HTTP can't, so the two never stand in for each other), key = pageKey(), `at` =
  * when it was fetched. The last line for a key wins, and `{"gone":1}` marks a 404/410. The file is only

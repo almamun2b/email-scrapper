@@ -3,9 +3,9 @@
 Crawls every website listed in a CSV file and extracts every email address it can find. Each input file produces an output CSV with one row per unique email, plus a summary log.
 
 ```
-websites/healthcare/nz_dentists_all.csv   ──►   emails/healthcare/emails/nz_dentists_all.csv
+websites/healthcare/nz_dentists_all.csv   ──►   results/healthcare/emails/nz_dentists_all.csv
 (list of websites, in a category folder)         (name, email, website, link)
-                                                 emails/healthcare/logs/nz_dentists_all.log
+                                                 results/healthcare/logs/nz_dentists_all.log
 ```
 
 Built with TypeScript on Node.js. It uses [cheerio](https://cheerio.js.org/) to parse HTML and [Playwright](https://playwright.dev/) (headless Chromium) as a fallback for JavaScript-rendered sites.
@@ -77,23 +77,23 @@ npm test
    npm run scrape
    ```
 
-3. Collect the results from `emails/healthcare/emails/nz_vets.csv`. The summary is in `emails/healthcare/logs/nz_vets.log`.
+3. Collect the results from `results/healthcare/emails/nz_vets.csv`. The summary is in `results/healthcare/logs/nz_vets.log`.
 
 With no arguments, `npm run scrape` processes only files in `websites/` (and its category folders) that don't have an output yet, so you can keep adding lists and re-running the same command.
 
 ## Categories
 
-A website list belongs to the category named by its folder, and everything it produces goes into one folder of the same name under `emails/`:
+A website list belongs to the category named by its folder, and everything it produces goes into one folder of the same name under `results/`:
 
 ```
-websites/dealers/au.ford.csv   ──►   emails/dealers/emails/au.ford.csv
-                                     emails/dealers/.cache/au.ford.jsonl
-                                     emails/dealers/logs/au.ford.log
-                                     emails/dealers/unique/dealers.csv     (from --unique)
+websites/dealers/au.ford.csv   ──►   results/dealers/emails/au.ford.csv
+                                     results/dealers/.cache/au.ford.jsonl
+                                     results/dealers/logs/au.ford.log
+                                     results/dealers/emails/unique/dealers.csv     (from --unique)
 ```
 
 - Current categories: `healthcare`, `martial-arts`, `dealers`. A new category is just a new folder: create `websites/<category>/` and put the CSVs in it. Only one level of folders counts.
-- A CSV placed directly in `websites/` (or given from outside it) has no category and gets its own folder named after the file: `websites/clinics.csv` writes to `emails/clinics/emails/clinics.csv`, `emails/clinics/.cache/`, and so on.
+- A CSV placed directly in `websites/` (or given from outside it) has no category and gets its own folder named after the file: `websites/clinics.csv` writes to `results/clinics/emails/clinics.csv`, `results/clinics/.cache/`, and so on.
 - Two lists with the same file name in different categories are fine. Two inputs that would write the same output file are an error.
 
 ## Input format
@@ -109,7 +109,7 @@ websites/dealers/au.ford.csv   ──►   emails/dealers/emails/au.ford.csv
 
 ## Output format
 
-`emails/<category>/emails/<input-file-name>.csv` (for a list with no category, `emails/<input-file-name>/emails/<input-file-name>.csv`):
+`results/<category>/emails/<input-file-name>.csv` (for a list with no category, `results/<input-file-name>/emails/<input-file-name>.csv`):
 
 | Column | Meaning |
 |---|---|
@@ -128,7 +128,7 @@ Lumino The Dentists,henderson@lumino.co.nz,https://lumino.co.nz/,https://lumino.
 
 Rules:
 - **One row per email per file.** If the same email appears on several sites, it is credited to the site that owns it: the first site whose domain is the email's domain (`sales@bydcastlehill.com.au` goes to `bydcastlehill.com.au`, even when a dealer-group page earlier in the list shows it too). Otherwise it goes to the first site where it was a real link or text rather than only in a script, and otherwise to the first site in input order.
-- **Shared emails go to their own file.** An email found on 3 or more sites, none of which owns its domain, is boilerplate: a regulator on privacy pages (`enquiries@oaic.gov.au`), a manufacturer's head office (`foacust1@ford.com`), a finance partner. Those rows go to `emails/<category>/shared/<name>.csv` (same columns, credited the same way) instead of the main CSV, and the summary's `Shared` line counts them.
+- **Every email stays in its list's own CSV.** An email found on many sites (a regulator on privacy pages, a manufacturer's head office) is credited the same way as any other and kept in the main CSV; there is no separate shared file.
 - Rows follow the input order of the websites.
 - If an email appears on several pages, `link` is the first page it was seen on. A later page wins only if it ties the email to a person name.
 - A `name` that starts with `=`, `+`, `-` or `@` is prefixed with `'`, so a hostile page title can't become a live formula in Excel or Google Sheets.
@@ -138,17 +138,17 @@ Rules:
 Each file is unique on its own, but the same email often appears in several files when the input lists overlap (the three theme-park lists share most of their websites). `--unique` combines existing outputs into one list with every email once. It scrapes nothing and leaves the per-file CSVs alone. The list stays inside the category's folder:
 
 ```bash
-npm run scrape -- --unique                                # one list per category -> emails/<category>/unique/<category>.csv
-npm run scrape -- --unique websites/dealers/au.*.csv      # only those files      -> emails/dealers/unique/au.csv
+npm run scrape -- --unique                                # one list per category -> results/<category>/emails/unique/<category>.csv
+npm run scrape -- --unique websites/dealers/au.*.csv      # only those files      -> results/dealers/emails/unique/au.csv
 ```
 
-With no arguments, each category folder in `emails/` gets its own combined list, so categories are never mixed. With files, the name is the prefix the input names share before their first `.`, `_` or `-` (`au.*` → `au`), or `all`. If the files you name belong to different categories, the combined list goes to `emails/unique/<name>.csv` instead, the only output outside a category folder. Columns are the same `name,email,website,link`. Each file's `shared/` rows (emails found on 3+ sites that don't own them) are included too, read after all the main CSVs, so an email that another file credits to its owner keeps that row. When an email is in several files, the row from the first file (sorted by category, then name) is kept. A summary (files, shared rows read and added, rows read, duplicates removed, most-overlapping files) is appended to `emails/<category>/logs/unique.<name>.log`.
+With no arguments, each category folder in `results/` gets its own combined list, so categories are never mixed. With files, the name is the prefix the input names share before their first `.`, `_` or `-` (`au.*` → `au`), or `all`. If the files you name belong to different categories, the combined list goes to `results/unique/<name>.csv` instead, the only output outside a category folder. Columns are the same `name,email,website,link`. When an email is in several files, the row from the first file (sorted by category, then name) is kept. A summary (files, rows read, duplicates removed, most-overlapping files) is appended to `results/<category>/logs/unique.<name>.log`.
 
 ## Command reference
 
 | Command | What it does |
 |---|---|
-| `npm run scrape` | Scrape every list in `websites/` (and its category folders) that has no output in `emails/` yet |
+| `npm run scrape` | Scrape every list in `websites/` (and its category folders) that has no output in `results/` yet |
 | `npm run scrape -- websites/dealers/a.csv [b.csv …]` | Scrape specific files. This always re-scrapes, even if an output exists |
 | `npm run scrape -- --force` | Re-scrape all files in `websites/` from scratch |
 | `npm run scrape -- --new-only [websites/dealers/a.csv]` | For a list that was already scraped and then got more websites: keep the cache and crawl only the sites not in it, then rebuild the CSV and log from all of them. Without a file it covers every list under `websites/`. Not combinable with `--force` or `--summary-only` |
@@ -158,10 +158,10 @@ With no arguments, each category folder in `emails/` gets its own combined list,
 | `npm run scrape -- --retry-capped --max-pages=N` | Continue the sites that reached the page cap from their saved queue, up to the higher cap `N` (the summary's `Capped` line) |
 | `npm run scrape -- --summary-only` | Scrape nothing. Rebuild the CSVs and summary logs from the cache, applying the current email and name rules. Skips (and leaves untouched) a file with no cache or an interrupted scrape |
 | `npm run scrape -- --summary-only --check-mx` | Same, and drop emails whose domain can't receive mail (no MX or address record in DNS). `--check-mx` works with any scrape too |
-| `npm run scrape -- --dry-run` | Show what a command would do with each file (scrape, resume, retry, skip), plus leftover markers and locks. Scrapes and writes nothing under `emails/` |
+| `npm run scrape -- --dry-run` | Show what a command would do with each file (scrape, resume, retry, skip), plus leftover markers and locks. Scrapes and writes nothing under `results/` |
 | `npm run scrape -- --help` | List every option |
-| `npm run scrape -- --unique` | Scrape nothing. Combine each category's outputs into `emails/<category>/unique/<category>.csv` with each email once. See [Unique emails across files](#unique-emails-across-files) |
-| `npm run scrape -- --unique websites/dealers/au.*.csv` | Same, for only the named files: writes `emails/dealers/unique/au.csv` |
+| `npm run scrape -- --unique` | Scrape nothing. Combine each category's outputs into `results/<category>/emails/unique/<category>.csv` with each email once. See [Unique emails across files](#unique-emails-across-files) |
+| `npm run scrape -- --unique websites/dealers/au.*.csv` | Same, for only the named files: writes `results/dealers/emails/unique/au.csv` |
 | `npm run scrape -- --quick` | Lighter, faster crawl (150 pages, 10 min per site). See [Crawl options](#crawl-options-depth-and-limits) |
 | `npm run scrape -- --log-level=debug` | Also write every failed request, timeout and robots decision to `logs/`. See [Diagnostic logs](#diagnostic-logs) |
 | `npm run typecheck` | Type-check the project with `tsc --noEmit` |
@@ -234,7 +234,7 @@ When to change them:
 
 ### Pages are scraped once per category
 
-Every page the scraper fetches is kept in `emails/<category>/.cache/.pages`, shared by all the lists of the category (`car-dealers-au` and so on) and by later runs. When any site of the category reaches a page again, with the same emails and links it gave before, the page is **not requested again**: sites of one group domain, several domains redirecting to one server, a list that grew (`--new-only`), a retry or an interrupted run all reuse it, and two sites crawled at the same time share one request. A page counts as the same page when its URL differs only by tracking or session params (`utm_*`, `fbclid`, `gclid`, `PHPSESSID`, …), empty params, param order, `#fragment`, `http`/`https`, `www.`, a trailing slash or an `index.html`. Params that choose the content (`?page=2`, `?id=7`) make a different page. A page that answered 404/410 is remembered too. Pages the headless browser rendered are kept apart from plain-HTTP ones, because the browser exists to get what HTTP can't. A site's first (landing) page is always requested, since its business name is read from it.
+Every page the scraper fetches is kept in `results/<category>/.cache/.pages`, shared by all the lists of the category (`car-dealers-au` and so on) and by later runs. When any site of the category reaches a page again, with the same emails and links it gave before, the page is **not requested again**: sites of one group domain, several domains redirecting to one server, a list that grew (`--new-only`), a retry or an interrupted run all reuse it, and two sites crawled at the same time share one request. A page counts as the same page when its URL differs only by tracking or session params (`utm_*`, `fbclid`, `gclid`, `PHPSESSID`, …), empty params, param order, `#fragment`, `http`/`https`, `www.`, a trailing slash or an `index.html`. Params that choose the content (`?page=2`, `?id=7`) make a different page. A page that answered 404/410 is remembered too. Pages the headless browser rendered are kept apart from plain-HTTP ones, because the browser exists to get what HTTP can't. A site's first (landing) page is always requested, since its business name is read from it.
 
 Reused pages count toward `--max-pages`, so a site gives the same result as it would without the store; only the requests are saved. The summary shows `N pages fetched + M reused`.
 
@@ -257,7 +257,7 @@ The most aggressive setting you might use is `--concurrency=24 --page-concurrenc
 - The per-server cap counts hostnames, not shared platforms. Hundreds of dealer sites run on the same platforms and CDNs, so those providers can still see a burst. Some rate-limit or block it, and blocked sites then look like "no emails found".
 - Heavily loaded sites hit the per-site budget (`--budget`, 20 minutes by default) sooner and return partial results, so you can get fewer emails until you continue them with `--retry-budget-queued`.
 
-**Recommended approach:** start with a moderate setting and watch the first file's failure counts in `emails/<category>/logs/<name>.log`. Raise the numbers only if the failures stay low.
+**Recommended approach:** start with a moderate setting and watch the first file's failure counts in `results/<category>/logs/<name>.log`. Raise the numbers only if the failures stay low.
 
 ```bash
 npm run scrape -- --concurrency=16 --page-concurrency=3 --host-concurrency=3
@@ -283,7 +283,7 @@ npm run scrape -- websites/big.csv --max-pages=800 --budget=40
 npm run scrape -- websites/huge.csv --max-depth=2 --concurrency=16
 ```
 
-The options used are also written into each summary in `emails/<category>/logs/<name>.log`, so you can see how every run was configured.
+The options used are also written into each summary in `results/<category>/logs/<name>.log`, so you can see how every run was configured.
 
 ## Running long jobs
 
@@ -317,12 +317,12 @@ kill 23456
 
 The scraper logs `SIGTERM received, shutting down`, closes the headless browser and exits. Stopping only the `npm` PID leaves the scraper running in the background.
 
-**Resume** after a stop, crash or reboot: run the same command again, or a plain `npm run scrape`. Sites already in `emails/<category>/.cache/<name>.jsonl` are skipped. This also works for an interrupted re-scrape (`--force` or an explicit file). Two runs can't work on the same file at once: the second one skips it with an error (see [Cache and resuming](#cache-and-resuming)).
+**Resume** after a stop, crash or reboot: run the same command again, or a plain `npm run scrape`. Sites already in `results/<category>/.cache/<name>.jsonl` are skipped. This also works for an interrupted re-scrape (`--force` or an explicit file). Two runs can't work on the same file at once: the second one skips it with an error (see [Cache and resuming](#cache-and-resuming)).
 
 After a run finishes:
-- `emails/<category>/emails/<name>.csv` holds the results.
-- `emails/<category>/logs/<name>.log` holds the summary: websites with emails, failures by reason, unique emails, and name breakdown.
-- Emails are unique within each file. For one list without repeats across files, run `npm run scrape -- --unique websites/dealers/au.*.csv` (writes `emails/dealers/unique/au.csv`).
+- `results/<category>/emails/<name>.csv` holds the results.
+- `results/<category>/logs/<name>.log` holds the summary: websites with emails, failures by reason, unique emails, and name breakdown.
+- Emails are unique within each file. For one list without repeats across files, run `npm run scrape -- --unique websites/dealers/au.*.csv` (writes `results/dealers/emails/unique/au.csv`).
 - `logs/error-<date>.log` lists every error from the run with its stack trace. If it's empty, nothing went wrong internally. See [Diagnostic logs](#diagnostic-logs).
 - If many sites failed with `unreachable` or `timeout` (often network hiccups), run `npm run scrape -- websites/<name>.csv --retry-failed`.
 - If the summary has a `Limited` or `Out of time` line, run `--retry-rate-limited` or `--retry-budget-queued=MIN`. See [Retrying and continuing sites](#retrying-and-continuing-sites).
@@ -403,7 +403,7 @@ Rebuild the CSVs and logs from the cache without touching the network:
 npm run scrape -- websites/dealers/au.*.csv --summary-only
 ```
 
-Combine all AU outputs into one list with each email once (`emails/dealers/unique/au.csv`), see [Unique emails across files](#unique-emails-across-files):
+Combine all AU outputs into one list with each email once (`results/dealers/emails/unique/au.csv`), see [Unique emails across files](#unique-emails-across-files):
 
 ```bash
 npm run scrape -- --unique websites/dealers/au.*.csv
@@ -413,14 +413,13 @@ Note that `npm run scrape -- websites/dealers/au.*.csv` always re-scrapes the fi
 
 ## Summary logs
 
-After each CSV is processed, a summary is printed and **appended** to `emails/<category>/logs/<name>.log`. The file keeps a history of every run.
+After each CSV is processed, a summary is printed and **appended** to `results/<category>/logs/<name>.log`. The file keeps a history of every run.
 
 ```
 [2026-09-29 13:49:30] nz_veterinarians_all.csv  (scrape, took 38m 12s)
   Websites : 72 total | 53 with emails | 14 no emails found | 5 failed
   Emails   : 241 unique (51 person name, 0 department page title, 120 input name, 70 business name)
   Crawl    : 3919 pages fetched | headless browser used on 17 sites
-  Shared   : 2 email(s) found on 3+ sites that don't own them -> shared/nz_veterinarians_all.csv (privacy@vetpartners.co.nz 9, enquiries@privacy.org.nz 4)
   Failures : unreachable=5 (dns=3, http-403=2)
   Out of time: 2 site(s) ran out of time budget with 317 page(s) still queued: vetent.co.nz (176), carevets.co.nz (141); continue them with --retry-budget-queued=MIN
   Capped   : 1 site(s) reached the page cap with 220 page(s) still queued: vetent.co.nz (220); continue them with --retry-capped --max-pages=N (a higher cap)
@@ -446,8 +445,6 @@ Failure reasons:
 "No emails found" means the site was crawled successfully but publishes no email address. Often it only has a contact form.
 
 A `Limited : N page(s) skipped on M site(s) …` line means those servers answered HTTP 429 (Too Many Requests) or 503 (Service Unavailable) even after one retry, so those pages were skipped. The busiest servers are listed. A few is normal. The scraper already slows down for a server that answers 429/503 (see [Politeness and robots.txt](#politeness-and-robotstxt)), so `--retry-rate-limited` is usually enough: it fetches just the skipped pages again. If the line stays large, run it with fewer parallel requests (`--host-concurrency=1`, or `--concurrency=6`). The per-site progress line also shows `N pages rate-limited`.
-
-A `Shared : N email(s) …` line counts the emails moved to `shared/<name>.csv` (see [Output format](#output-format)), with the most widespread ones.
 
 A `Capped : N site(s) …` line means those sites reached `--max-pages` with pages still queued. Contact-like pages are fetched first, so what's left is mostly deep pages; `--retry-capped --max-pages=N` continues them if you want more.
 
@@ -497,11 +494,11 @@ jq -c 'select(.site == "https://example.co.nz/")' logs/scraper-2026-10-03.log
 
 ## Cache and resuming
 
-Each finished site is appended as one JSON line to `emails/<category>/.cache/<name>.jsonl`. The line holds the site URL, final URL after redirects, business name, emails with names, page titles, links and where each email was found (`source`), pages fetched, whether the browser was used, and any error with its detail (`errorDetail`). A site that ran out of time, reached the page cap or had pages rate-limited also saves what is left (`budgetQueued` or `capQueued`, and `resume` with the queued and refused pages and the pages already seen), which the `--retry-*` flags continue from.
+Each finished site is appended as one JSON line to `results/<category>/.cache/<name>.jsonl`. The line holds the site URL, final URL after redirects, business name, emails with names, page titles, links and where each email was found (`source`), pages fetched, whether the browser was used, and any error with its detail (`errorDetail`). A site that ran out of time, reached the page cap or had pages rate-limited also saves what is left (`budgetQueued` or `capQueued`, and `resume` with the queued and refused pages and the pages already seen), which the `--retry-*` flags continue from.
 
 Output and cache files hold personal data, so new ones are created readable by their owner only (folders `0700`, files `0600`).
 
-Files in `emails/<category>/.cache/` for each input `<name>`:
+Files in `results/<category>/.cache/` for each input `<name>`:
 
 | File | Meaning |
 |---|---|
@@ -607,7 +604,7 @@ npx tsx scripts/given-names-report.ts 2
 - The browser follows redirects inside Chromium, so a redirect hop there is checked against `robots.txt` only after it loads (its page is then discarded).
 - Sites whose `robots.txt` forbids generic crawlers are skipped by design.
 - Name detection is heuristic. When it isn't confident, it falls back to the business name rather than guessing. People whose first name isn't in the given-name list only get a person name when the page itself ties the name to the email.
-- Aggregator and government sites often list emails belonging to other organisations. Those rows are credited to the site they were found on, unless another input site owns the email's domain, or the email is on 3+ sites and goes to `shared/`. A dealer group's email shown on several dealer sites in the list goes to `shared/` too when none of those sites is on the group's domain.
+- Aggregator and government sites often list emails belonging to other organisations. Those rows are credited to the site they were found on, unless another input site owns the email's domain. A dealer group's email shown on several dealer sites in the list is credited to the first of them when none of those sites is on the group's domain.
 
 ## Responsible use
 
@@ -618,12 +615,12 @@ These are publicly published business contact details. If you use them for marke
 ```
 src/
   index.ts      CLI entry: argument handling, file selection, --dry-run
-  run.ts        Per-file run: hard timeouts, retries, CSV and shared outputs, summary logs, --unique
+  run.ts        Per-file run: hard timeouts, retries, CSV outputs, summary logs, --unique
   cli.ts        Command-line parsing, validation and --help text
   input.ts      Reading the website column of an input CSV
   cache.ts      Cache file, resume marker, rotation and per-file lock
   pages.ts      Per-category store of fetched pages (reuse, revalidation, in-flight sharing)
-  output.ts     CSV rows (crediting each email to its site, shared emails), formula-safe cells, re-checking cached results
+  output.ts     CSV rows (crediting each email to its site), formula-safe cells, re-checking cached results
   mx.ts         --check-mx: whether an email's domain can receive mail
   abort.ts      Waits that give up when a site's time is up
   logger.ts     pino logger: console + logs/*.log JSON files, per-site context, crash/signal handlers
@@ -639,7 +636,7 @@ src/
 test/           node:test suites and a local test server (npm test)
 scripts/        recheck-cache.ts, given-names-report.ts, mark-budget-from-logs.ts
 websites/       Input CSVs, in category folders: websites/<category>/*.csv (git-ignored)
-emails/         One folder per category, each with emails/ (the output CSVs), shared/, logs/, .cache/ and unique/ (git-ignored)
+results/        One folder per category, each with emails/ (the output CSVs, plus unique/ from --unique), logs/ and .cache/ (git-ignored)
 logs/           Diagnostic JSON logs: scraper-<date>.log, error-<date>.log (git-ignored)
 ```
 

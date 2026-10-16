@@ -3,7 +3,7 @@ import path from 'node:path';
 
 export const ROOT = path.resolve(import.meta.dirname, '..');
 export const IN_DIR = path.join(ROOT, 'websites');
-export const OUT_DIR = path.join(ROOT, 'emails');
+export const OUT_DIR = path.join(ROOT, 'results');
 
 /** Everything one input file writes. `id` (`dealers/au.ford`) names it in messages and logs. */
 export interface FileLayout {
@@ -16,12 +16,11 @@ export interface FileLayout {
   cacheDir: string;
   logDir: string;
   uniqueDir: string;
-  sharedFile: string; // emails found on many sites that don't own them (assignRows)
   pagesFile: string; // every page the category has fetched, shared by all its lists (PageStore)
   pagesLock: string; // PID of the run using pagesFile
 }
 
-/** Folder inside a group that holds its output CSVs (emails/<group>/emails/*.csv). */
+/** Folder inside a group that holds its output CSVs (results/<group>/emails/*.csv) and the unique/ lists. */
 const EMAILS_SUBDIR = 'emails';
 
 const baseName = (f: string) => path.basename(f, path.extname(f));
@@ -33,14 +32,14 @@ function folderIn(dir: string, file: string): string | undefined {
   return rel;
 }
 
-/** The category of an input or output CSV: its folder under websites/ (websites/<category>/x.csv) or emails/ (emails/<category>/emails/x.csv), else undefined. */
+/** The category of an input or output CSV: its folder under websites/ (websites/<category>/x.csv) or results/ (results/<category>/emails/x.csv), else undefined. */
 export function categoryOf(file: string, inDir = IN_DIR, outDir = OUT_DIR): string | undefined {
   const rel = path.relative(outDir, path.dirname(path.resolve(file))).split(path.sep);
   const fromOutput = rel.length === 2 && rel[1] === EMAILS_SUBDIR && rel[0] && rel[0] !== '..' && rel[0] !== '.' ? rel[0] : undefined;
   return folderIn(inDir, file) ?? fromOutput;
 }
 
-/** The emails/<group>/ folder for a CSV: its category, else its own base name, so an uncategorized list gets a folder to itself. */
+/** The results/<group>/ folder for a CSV: its category, else its own base name, so an uncategorized list gets a folder to itself. */
 export function groupOf(file: string, inDir = IN_DIR, outDir = OUT_DIR): string {
   return categoryOf(file, inDir, outDir) ?? baseName(file);
 }
@@ -57,8 +56,7 @@ export function fileLayout(group: string, base: string, outDir = OUT_DIR): FileL
     outFile: path.join(emailsDir, `${base}.csv`),
     cacheDir: path.join(groupDir, '.cache'),
     logDir: path.join(groupDir, 'logs'),
-    uniqueDir: path.join(groupDir, 'unique'),
-    sharedFile: path.join(groupDir, 'shared', `${base}.csv`),
+    uniqueDir: path.join(emailsDir, 'unique'),
     // dotted, so no list's own cache files (`<base>.jsonl`, `<base>.lock`) can share these names
     pagesFile: path.join(groupDir, '.cache', '.pages'),
     pagesLock: path.join(groupDir, '.cache', '.pages.lock'),
@@ -83,7 +81,7 @@ export function findInputs(inDir = IN_DIR): string[] {
   return files.sort();
 }
 
-/** Output CSVs per group folder (emails/<group>/emails/*.csv); the cross-group emails/unique/ and emails/logs/ are not groups. */
+/** Output CSVs per group folder (results/<group>/emails/*.csv, not its unique/ subfolder); the cross-group results/unique/ and results/logs/ are not groups. */
 export function findOutputs(outDir = OUT_DIR): Map<string, string[]> {
   const groups = new Map<string, string[]>();
   if (!fs.existsSync(outDir)) return groups;

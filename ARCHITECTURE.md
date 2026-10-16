@@ -6,14 +6,14 @@ This document explains how the email scraper is put together: the data flow, the
 
 ```
 websites/<category>/<name>.csv
-        │  paths.ts findInputs()/groupOf()/fileLayout(): category → emails/<group>/
+        │  paths.ts findInputs()/groupOf()/fileLayout(): category → results/<group>/
         │  input.ts readSites(): find the website column, normalise, dedupe by host+path+query
         ▼
 ┌──────────────── src/index.ts → src/run.ts ────────────────────┐
 │  for each input file (in order; a failing one is skipped)     │
-│    acquireLock(emails/<group>/.cache/<name>.lock)             │
+│    acquireLock(results/<group>/.cache/<name>.lock)             │
 │    beginScrape(): resume (.inprogress) or rotate old cache    │
-│    load emails/<group>/.cache/<name>.jsonl  (resume / reuse)  │
+│    load results/<group>/.cache/<name>.jsonl  (resume / reuse)  │
 │    --retry-*: planRetries() → re-crawl or continue a site     │
 │    p-limit(--concurrency=12) over uncached sites:             │
 │        runSite(): scrapeSite(site, opts, signal)              │
@@ -24,8 +24,8 @@ websites/<category>/<name>.csv
 │    recheckSite() every result with the current rules          │
 │    --check-mx: drop emails whose domain can't receive mail    │
 │    assignRows(): credit each email to the site owning it;     │
-│      emails on 3+ non-owning sites → shared/<name>.csv        │
-│    writeSummary() → log + emails/<group>/logs/<name>.log      │
+│      → results/<group>/emails/<name>.csv                      │
+│    writeSummary() → log + results/<group>/logs/<name>.log      │
 │    endScrape(): remove .inprogress                            │
 └───────────────────────────────────────────────────────────────┘
         │ scrapeSite(site)
@@ -102,14 +102,14 @@ interface FoundOnPage {
 
 `index.ts` only handles the command line (`--help`, flags, file selection, `--dry-run`) and calls into `run.ts`, which holds the per-file work (`processFile()`, `runSite()`, `writeSummary()`, `runUnique()`, `previewFile()`, `staleState()`). `index.ts` runs `main()` on import, so everything testable lives in `run.ts`.
 
-- **Layout (`src/paths.ts`):** every input maps to a group folder `emails/<group>/` that holds its output CSVs in `emails/<group>/emails/`, plus `.cache/`, `logs/` and `unique/`. The group is the input's category folder (`websites/<category>/x.csv`, one level deep), else the file's own base name, so a list with no category gets a folder to itself. `fileLayout()` builds all the paths and `findInputs()` lists `websites/*.csv` plus `websites/*/*.csv`. `--unique` with no files writes one list per group folder, inside it; across groups it falls back to `emails/unique/`. It reads each input's `shared/<base>.csv` after all the main CSVs (`writeUnique()`), so shared emails are in the combined list but never displace an owner's row.
+- **Layout (`src/paths.ts`):** every input maps to a group folder `results/<group>/` that holds its output CSVs in `results/<group>/emails/`, plus `.cache/` and `logs/`; the `--unique` lists go in `results/<group>/emails/unique/`. The group is the input's category folder (`websites/<category>/x.csv`, one level deep), else the file's own base name, so a list with no category gets a folder to itself. `fileLayout()` builds all the paths and `findInputs()` lists `websites/*.csv` plus `websites/*/*.csv`. `--unique` with no files writes one list per group folder, inside it; across groups it falls back to `results/unique/`.
 - **Target selection:** with no file arguments, it uses every input found by `findInputs()` whose output doesn't exist, plus any whose scrape was interrupted (`.inprogress` marker). `--force` and `--summary-only` lift that skip; the `--retry-*` flags take only inputs that have an output (there is nothing to retry otherwise). `--summary-only` and `--unique` refuse to be combined with a retry flag. Explicit file arguments are always processed. Two targets that would write the same output file are an error. A file that throws (an unreadable CSV, a lock held by another run, a bug) is logged and skipped, the other files still run, and the process exits with code 1 at the end.
-- **`--dry-run`:** `previewFile()` says per target what `processFile()` would do (scrape, resume, rotate and re-scrape, retry counts from `planRetries()`, rebuild, or skip), reading the input and cache only; it takes no lock and writes nothing under `emails/`. `staleState()` then lists `.inprogress` markers whose input is gone and locks whose PID is dead.
+- **`--dry-run`:** `previewFile()` says per target what `processFile()` would do (scrape, resume, rotate and re-scrape, retry counts from `planRetries()`, rebuild, or skip), reading the input and cache only; it takes no lock and writes nothing under `results/`. `staleState()` then lists `.inprogress` markers whose input is gone and locks whose PID is dead.
 - **Startup order:** `--log-level` is read first and file logging starts before the rest of the command line is validated, so a bad flag still lands in `logs/error-<date>.log`.
 - **Concurrency:** `--concurrency` sites at once (12). `runSite()` gives each site a hard limit of `budget + 4 min` (24 min by default). At the limit it aborts the site's `AbortSignal`; `scrapeSite` then stops its workers, sitemap loading, in-flight requests and any wait for a server or browser slot (`untilAborted()`, `abort.ts`), closes its browser page, and returns what it found with `error: 'timeout'`. If it still doesn't return within `STOP_GRACE_MS` (30 s), the site gets the partial result `scrapeSite`/`resumeSite` reported through `onPartial` just before the browser phase (with `error: 'timeout'`), else an empty one. If `scrapeSite` rejects, the error is logged with its stack and the site gets `error: 'internal-error'`, so the rest of the run continues. When `runSite()` continues a site (`resumeSite()`), the fallbacks return the site's earlier result instead of an empty one.
 - **Retries:** `retryOptions()` gives the four independent retry flags (`--retry-capped` requires `--max-pages`). `planRetries()` (in `cache.ts`) sorts the cached rows: `--retry-failed` failures go to `recrawl`; rows selected by `--retry-rate-limited` / `--retry-budget-queued` / `--retry-capped` that have the saved state they need go to `resume` with the parts to work on; selected rows without it (pre-v3 rows, or rows marked by `scripts/mark-budget-from-logs.ts`) go to `recrawl` and, if they have emails, to `previous`. A re-crawled row in `previous` is passed to `mergeResults(prev, next)`: the old row's emails stay exactly as they were and only addresses the re-crawl found that it didn't have are added (owner decision), while the crawl state (`resume`, `budgetQueued`, `capQueued`, `rateLimited`, `v`) comes from the re-crawl, so a mark from the logs doesn't send the row into every later retry. `--retry-budget-queued=MIN` sets the run's `budgetMs` (an error together with `--budget`).
 - **CSV and summary:** every `SiteResult` (fresh or cached) goes through `recheckSite()` first, so outputs always follow the current email and name rules. With `--check-mx`, `undeliverable()` (`mx.ts`) drops emails whose domain can't receive mail. Then `assignRows()` and `writeSummary()` run as below. CSVs are written atomically (`writeFileAtomic()`), new files `0600` in `0700` folders. The cache file is not rewritten.
-- **Summary:** `writeSummary()` prints the summary and appends it to `emails/<group>/logs/<name>.log`. It counts sites with emails, sites with no emails, failed sites grouped by reason (with `errorDetail` counts per reason), partial results, emails moved to `shared/` (`Shared`), `--check-mx` drops, rate-limited pages (`Limited`), sites that ran out of time with pages queued (`Out of time`, from `budgetRetry()`), sites that reached the page cap (`Capped`), sites missing from the cache, the name-source breakdown (person, department, input name, business), and top sites.
+- **Summary:** `writeSummary()` prints the summary and appends it to `results/<group>/logs/<name>.log`. It counts sites with emails, sites with no emails, failed sites grouped by reason (with `errorDetail` counts per reason), partial results, `--check-mx` drops, rate-limited pages (`Limited`), sites that ran out of time with pages queued (`Out of time`, from `budgetRetry()`), sites that reached the page cap (`Capped`), sites missing from the cache, the name-source breakdown (person, department, input name, business), and top sites.
 
 ### `src/cli.ts`: command line
 
@@ -121,7 +121,7 @@ interface FoundOnPage {
 
 ### `src/cache.ts`: cache lifecycle
 
-Per input file, in `emails/<group>/.cache/` (the group's cache dir is passed to `cacheFiles()`):
+Per input file, in `results/<group>/.cache/` (the group's cache dir is passed to `cacheFiles()`):
 - `<name>.jsonl`: the only file the loaders read. Sites are appended as they finish.
 - `<name>.inprogress`: written by `beginScrape()`, removed by `endScrape()` after the CSV and summary are written. If it exists at the start of a scrape, the scrape resumes from the cache instead of resetting. That's what makes an interrupted `--force` or explicit-file re-scrape resumable.
 - `<name>.<YYYYMMDD-HHMMSS>.jsonl`: when a file with an existing output is scraped again (and isn't resuming), `beginScrape()` renames the old cache to this name instead of deleting it. The owner keeps every cache for later analysis.
@@ -141,7 +141,7 @@ A `--retry-*` run passes `keepCache` to `beginScrape()`, so the finished run's c
 ### `src/output.ts`: rows
 
 - `recheckSite()` runs `recheckRow()` on every email, merges duplicates (a ROT13 decode can land on an address the site already had), runs `demoteRolePrefixes()`, and tidies the cached business name (`tidyBusinessName()`, falling back to the domain).
-- `assignRows(sites, done, inputNames)`: one row per email across the whole file. Each email is credited to its **owner**: the first site whose registrable domain (tldts `getDomain` of the input URL or the landing URL) is the email's, else the first site where its `source` isn't `raw`, else the first site. An email found on `SHARED_MIN_SITES` (3) or more distinct sites (by registrable domain of the landing URL), none of which owns it, goes to `shared` instead: boilerplate such as a regulator's address on every privacy page (owner decision). Rows are ordered by the credited site's input position, then the email's order on that site. `name = e.name || e.pageTitle || inputNames.get(site) || r.business`, passed through `safeCell()`, which prefixes `'` to anything starting with `=`, `+`, `-`, `@`, tab or CR (CSV formula injection). It also counts which fallback named each row (`kinds`) for the summary. The columns are fixed: `name,email,website,link`, for `shared/<name>.csv` too.
+- `assignRows(sites, done, inputNames)`: one row per email across the whole file. Each email is credited to its **owner**: the first site whose registrable domain (tldts `getDomain` of the input URL or the landing URL) is the email's, else the first site where its `source` isn't `raw`, else the first site. Rows are ordered by the credited site's input position, then the email's order on that site. `name = e.name || e.pageTitle || inputNames.get(site) || r.business`, passed through `safeCell()`, which prefixes `'` to anything starting with `=`, `+`, `-`, `@`, tab or CR (CSV formula injection). It also counts which fallback named each row (`kinds`) for the summary. The columns are fixed: `name,email,website,link`.
 
 ### `src/crawler.ts`: crawling a site
 
@@ -158,7 +158,7 @@ A `--retry-*` run passes `keepCache` to `beginScrape()`, so the finished run's c
 
 The per-site state (host, robots, section, `seen`, `PageQueue`, `depthOf`, emails, `enqueue`/`ingest`) lives in a `SiteCrawl`, and the worker pool is `runQueue()`. `crawl()` builds a `SiteCrawl` from the landing page and sitemap; `resumeSite()` builds one from a saved `ResumeState`. `runQueue()` returns why it stopped: `'time'` (deadline or abort signal with pages still queued), `'cap'` (`maxPages` attempts used with pages still queued) or `'done'`. A page whose fetch the hard stop cut off goes back into the queue (its attempt is given back), so it is saved too.
 
-**Page store (`src/pages.ts`, `PageStore`).** One append-only file per category, `emails/<group>/.cache/.pages`, opened once per process by `openPages()` in `run.ts` (guarded by `.pages.lock`, closed by `closePages()` in `index.ts`). A line is `<mode><key>\t<at>\t<json>`: mode `h` (plain HTTP) or `b` (browser, never mixed with `h`), key = `pageKey()` from `urls.ts` (canonical URL without the scheme, so tracking/session/empty params, order, `www.`, trailing slash and index files don't make a different page; content params like `?page=2` do), `at` = fetch time. The last line for a key wins; `{"gone":1}` is a 404/410. Memory holds only an index of `key → offset/length/at`; records are read back on demand. A `PageRecord` is site-independent: the page's `Found` emails, its `<h1>`/`<title>` as a possible department name, its crawlable same-site links, and `etag`/`lastModified`.
+**Page store (`src/pages.ts`, `PageStore`).** One append-only file per category, `results/<group>/.cache/.pages`, opened once per process by `openPages()` in `run.ts` (guarded by `.pages.lock`, closed by `closePages()` in `index.ts`). A line is `<mode><key>\t<at>\t<json>`: mode `h` (plain HTTP) or `b` (browser, never mixed with `h`), key = `pageKey()` from `urls.ts` (canonical URL without the scheme, so tracking/session/empty params, order, `www.`, trailing slash and index files don't make a different page; content params like `?page=2` do), `at` = fetch time. The last line for a key wins; `{"gone":1}` is a 404/410. Memory holds only an index of `key → offset/length/at`; records are read back on demand. A `PageRecord` is site-independent: the page's `Found` emails, its `<h1>`/`<title>` as a possible department name, its crawlable same-site links, and `etag`/`lastModified`.
 - `runQueue` calls `PageStore.load(mode, key, cutoff, fetch)`: a copy at least as new as `cutoff` is reused; a page another site is fetching right now is awaited (one request for 12 parallel sites); otherwise `fetch(stale)` runs, with the older copy so it can send `If-None-Match` / `If-Modified-Since`. A 304 re-appends the old record with a new `at`. A failed fetch is not remembered (waiting sites try themselves), except a 404/410.
 - `cutoff` is per list, in `processFile()`: `startedAt − --revalidate days` (30 by default), or `startedAt` for a fresh re-scrape of a list (output exists, not a retry/`--new-only`/resume), so pages fetched during the run are never stale in it.
 - Reused pages still count toward `--max-pages` (`attempts`), so a site's crawl is identical to one without the store; `SiteResult.reused` and the summary's `+ M reused` show how many requests were saved. The landing page is always requested (its HTML gives the business name and the JS-rendered check) but is stored for other sites. Sitemaps are memoised per run (`PageStore.sitemap`).
@@ -229,7 +229,7 @@ One shared browser runs across the whole process, with a new context per site (`
   - Node `warning`s are logged as `warn`.
   - SIGINT and SIGTERM close the browser and exit with 130/143.
 - **What is logged where:** run, file and site lifecycle at info. Failed sites, exhausted rate-limit retries, hard timeouts, skipped input rows and locked files at warn or error. Browser launch failures and site crashes at error. Every individual request failure (status, network error code, timeout), refused private address and skipped off-site redirect at debug.
-- **Separate from the summaries:** `emails/<group>/logs/<name>.log` (the human summary per input file) is separate and unchanged.
+- **Separate from the summaries:** `results/<group>/logs/<name>.log` (the human summary per input file) is separate and unchanged.
 
 ### `src/extract.ts`: emails and names
 
@@ -281,7 +281,7 @@ One shared browser runs across the whole process, with a new context per site (`
 
 `npm test` runs `node --import tsx --test test/*.test.ts`. There are no network calls except one DNS lookup of a `.invalid` name: crawler tests run against `test/helpers/server.ts`, a small `node:http` server on 127.0.0.1 (and 127.0.0.2 for "another site", or another port for "another origin of the same site") that records each request's path and time, and the browser tests skip themselves when Chromium isn't installed. `processFile()` is tested end to end in a temp folder. `tsconfig.json` includes `test/` and `scripts/`, so `npm run typecheck` covers them too. CI (`.github/workflows/ci.yml`) runs both on Node 22 and 24 on every push and pull request, with Chromium installed (`SCRAPER_NO_SANDBOX=1`, as the runners restrict user namespaces).
 
-`scripts/recheck-cache.ts` re-runs `recheckSite()` over every real cached row (via `loadCache()`, so superseded lines don't count) and reports dropped and decoded emails and changed names, then per file which emails `assignRows()` would credit to a different site than "first site wins", which go to `shared/`, and how many rows get the input's name, without writing anything. Run it after changing `extract.ts` or `output.ts`. `scripts/given-names-report.ts` lists first parts of `first.last@` addresses missing from the given-name list, for review. `scripts/mark-budget-from-logs.ts` marks pre-v3 rows that the logs say ran out of time (`budgetQueued`), so `--retry-budget-queued` re-crawls them; it is a dry run unless given `--write`, only appends, takes the file's lock and skips files with an `.inprogress` marker.
+`scripts/recheck-cache.ts` re-runs `recheckSite()` over every real cached row (via `loadCache()`, so superseded lines don't count) and reports dropped and decoded emails and changed names, then per file which emails `assignRows()` would credit to a different site than "first site wins", and how many rows get the input's name, without writing anything. Run it after changing `extract.ts` or `output.ts`. `scripts/given-names-report.ts` lists first parts of `first.last@` addresses missing from the given-name list, for review. `scripts/mark-budget-from-logs.ts` marks pre-v3 rows that the logs say ran out of time (`budgetQueued`), so `--retry-budget-queued` re-crawls them; it is a dry run unless given `--write`, only appends, takes the file's lock and skips files with an `.inprogress` marker.
 
 ## Key design decisions
 
@@ -298,7 +298,7 @@ One shared browser runs across the whole process, with a new context per site (`
 | Append-only JSONL cache, kept forever (rotated, never deleted) | Crash-safe resume, cheap `--retry-*` / `--summary-only`, and data for later heuristic tuning |
 | Outputs re-check cached rows with the current rules | Heuristic fixes apply to existing outputs through `--summary-only`, without re-scraping |
 | One row per email per file, credited to the site that owns it | Aggregator sites repeat the same addresses. Output is a contact list, not a page index. Dealer-locator data puts every dealer's email on every dealer site, so "first site wins" credited them to the wrong dealer |
-| Emails on 3+ sites that none of them owns go to `shared/<name>.csv` | Owner decision (2026-10-13). Regulator, head-office and finance-partner addresses on privacy pages are noise in the main list, but nothing is thrown away |
+| No shared file: every email goes into its own list's CSV | Owner decision (2026-10-16), reversing the 2026-10-13 `shared/` rule. Each website list produces exactly its own email CSV |
 | Name order: person, department title, input name, scraped business name | Owner decision (2026-10-13). The input's own names are curated; scraped ones produced "Home" and "Welcome to …" |
 | A re-crawl keeps the old row and only adds new emails | Owner decision (2026-10-13). A re-crawl that finds fewer emails (rate-limited, site changed) must not replace what was found before |
 | Save the queue at the page cap too (`--retry-capped`) | Audit 2026-10-13: 18% of cached sites reached 400 pages. Going deeper later shouldn't mean starting over |
