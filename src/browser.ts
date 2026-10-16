@@ -1,3 +1,6 @@
+import { spawn } from 'node:child_process';
+import { createRequire } from 'node:module';
+import path from 'node:path';
 import pLimit from 'p-limit';
 import { chromium, type Browser, type BrowserContext, type Route } from 'playwright';
 import { untilAborted } from './abort.js';
@@ -50,6 +53,38 @@ function getBrowser(): Promise<Browser> {
     );
   }
   return browserPromise;
+}
+
+/** Runs `playwright install chromium` with the installed Playwright's own CLI, output shown on the terminal. */
+function installChromium(): Promise<void> {
+  const cli = path.join(path.dirname(createRequire(import.meta.url).resolve('playwright/package.json')), 'cli.js');
+  return new Promise((resolve, reject) => {
+    const child = spawn(process.execPath, [cli, 'install', 'chromium'], { stdio: 'inherit' });
+    child.on('error', reject);
+    child.on('exit', (code) => (code === 0 ? resolve() : reject(new Error(`playwright install chromium exited with code ${code}`))));
+  });
+}
+
+/**
+ * Starts and closes Chromium once before a run. If Playwright's Chromium is missing (or is not the build the
+ * installed Playwright expects), it is installed first, so the browser phase never fails a whole run.
+ * Other launch failures (e.g. the sandbox) are left to getBrowser(), which reports them with its own hint.
+ */
+export async function ensureBrowser(): Promise<void> {
+  const sandbox = process.env.SCRAPER_NO_SANDBOX !== '1';
+  const tryLaunch = async () => (await chromium.launch({ headless: true, chromiumSandbox: sandbox })).close();
+  try {
+    await tryLaunch();
+  } catch (err) {
+    if (!/Executable doesn't exist|playwright install/i.test(String(err))) {
+      log.warn({ err }, `Headless browser check failed: ${firstLine(err)}`);
+      return;
+    }
+    log.warn("Playwright's Chromium is not installed; installing it (npx playwright install chromium)");
+    await installChromium();
+    await tryLaunch();
+    log.info('Playwright Chromium installed');
+  }
 }
 
 export async function closeBrowser(): Promise<void> {

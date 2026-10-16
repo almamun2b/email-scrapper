@@ -3,6 +3,7 @@ import path from 'node:path';
 import type { LevelWithSilent } from 'pino';
 import { cacheFiles, LockedError } from './cache.js';
 import { DEFAULT_REVALIDATE_DAYS, parseArgs, rawFlag, RETRY_FLAGS, retryOptions, USAGE } from './cli.js';
+import { ensureBrowser } from './browser.js';
 import { closeBrowser, DEFAULT_OPTIONS, QUICK_OPTIONS, setHostConcurrency } from './crawler.js';
 import { initFileLogging, installProcessHandlers, log, LOG_DIR, parseLevel, runId, withLogContext } from './logger.js';
 import { categoryOf, fileLayout, findInputs, groupOf, IN_DIR, OUT_DIR, ROOT } from './paths.js';
@@ -77,6 +78,8 @@ async function main() {
     }
   }
 
+  // The browser fallback needs Chromium; install it up front instead of failing every site that needs it.
+  if (!dryRun && !summaryOnly && opts.browserPages > 0) await ensureBrowser();
   if (!dryRun) fs.mkdirSync(OUT_DIR, { recursive: true, mode: 0o700 });
   let failedFiles = 0;
   for (const { file: f, layout } of targets) {
