@@ -326,7 +326,7 @@ After a run finishes:
 - `logs/error-<date>.log` lists every error from the run with its stack trace. If it's empty, nothing went wrong internally. See [Diagnostic logs](#diagnostic-logs).
 - If many sites failed with `unreachable` or `timeout` (often network hiccups), run `npm run scrape -- websites/<name>.csv --retry-failed`.
 - If the summary has a `Limited` or `Out of time` line, run `--retry-rate-limited` or `--retry-budget-queued=MIN`. See [Retrying and continuing sites](#retrying-and-continuing-sites).
-- If failures read `browserType.launch: Executable doesn't exist …`, Playwright's Chromium isn't installed, or doesn't match the installed Playwright version. Every site that needs the browser fallback then fails. Fix it with the command below, then rerun with `--retry-failed`:
+- Every scrape run first starts the headless browser once and installs Playwright's Chromium itself if it is missing (`ensureBrowser()`; skipped with `--summary-only`, `--dry-run`, `--unique` and `--browser-pages=0`). If failures still read `browserType.launch: Executable doesn't exist …`, install it by hand with the command below, then rerun with `--retry-failed`:
 
   ```bash
   npx playwright install chromium
