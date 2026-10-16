@@ -151,6 +151,7 @@ With no arguments, each category folder in `emails/` gets its own combined list,
 | `npm run scrape` | Scrape every list in `websites/` (and its category folders) that has no output in `emails/` yet |
 | `npm run scrape -- websites/dealers/a.csv [b.csv …]` | Scrape specific files. This always re-scrapes, even if an output exists |
 | `npm run scrape -- --force` | Re-scrape all files in `websites/` from scratch |
+| `npm run scrape -- --new-only [websites/dealers/a.csv]` | For a list that was already scraped and then got more websites: keep the cache and crawl only the sites not in it, then rebuild the CSV and log from all of them. Without a file it covers every list under `websites/`. Not combinable with `--force` or `--summary-only` |
 | `npm run scrape -- --retry-failed` | Crawl again, from the start, only the sites that failed with no emails (unreachable, timeout, …). Everything else comes from the cache. Rebuilds the CSVs and logs. See [Retrying and continuing sites](#retrying-and-continuing-sites) |
 | `npm run scrape -- --retry-rate-limited` | Fetch again only the pages a server refused with HTTP 429/503 (and the new links on them), and merge what they give into each site's result |
 | `npm run scrape -- --retry-budget-queued[=MIN]` | Continue the sites that ran out of time budget from where they stopped: only the pages still queued are fetched, with a budget of `MIN` minutes per site (default: `--budget`) |

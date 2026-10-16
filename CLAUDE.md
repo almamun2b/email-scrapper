@@ -16,6 +16,7 @@ npx tsx scripts/recheck-cache.ts                 # what the current rules would 
 npm run scrape                                   # every list under websites/ (and websites/<category>/) without an output yet
 npm run scrape -- websites/dealers/x.csv         # specific file(s); always re-scrapes
 npm run scrape -- --force                        # re-scrape everything
+npm run scrape -- --new-only x.csv               # list grew: keep the cache, scrape only sites not cached yet
 npm run scrape -- --retry-failed                 # re-crawl sites that failed with no emails, reuse cache for the rest
 npm run scrape -- --retry-rate-limited           # fetch only the pages servers refused with 429/503 (saved per site)
 npm run scrape -- --retry-budget-queued=60       # continue sites that ran out of time from their saved queue, 60 min each

@@ -30,6 +30,11 @@ test('parseArgs accepts valid flags in both forms', () => {
   assert.deepEqual(a.files, ['x.csv']);
 });
 
+test('parseArgs accepts --new-only and it takes no value', () => {
+  assert.ok(parseArgs(['--new-only', 'x.csv']).flags.has('new-only'));
+  assert.throws(() => parseArgs(['--new-only=1']), /takes no value/);
+});
+
 test('parseArgs rejects values on boolean flags, fractions on counts, unknown flags (L1)', () => {
   assert.throws(() => parseArgs(['--force=false']), /takes no value/);
   assert.throws(() => parseArgs(['--quick=0']), /takes no value/);
@@ -133,6 +138,17 @@ test('--retry-failed reuses a finished run\'s cache instead of rotating it', () 
   assert.deepEqual(r, { resumed: false, rotatedTo: undefined });
   assert.equal(fs.readFileSync(files.cache, 'utf8'), line);
   assert.deepEqual(fs.readdirSync(dir).sort(), ['x.inprogress', 'x.jsonl']);
+});
+
+test('--new-only reuses a finished run\'s cache, so only sites missing from it are scraped', () => {
+  const dir = tmp();
+  const files = cacheFiles(dir, 'x');
+  const line = JSON.stringify(site('https://a.nz/')) + '\n';
+  fs.writeFileSync(files.cache, line);
+  const r = beginScrape(files, true, true);
+  assert.equal(r.rotatedTo, undefined);
+  assert.equal(fs.readFileSync(files.cache, 'utf8'), line);
+  assert.deepEqual([...loadCache(files.cache).keys()], ['https://a.nz/']);
 });
 
 test('an interrupted re-scrape resumes instead of resetting again (H3)', () => {
@@ -521,7 +537,10 @@ test('--dry-run describes each file without writing anything (F2)', () => {
   fs.mkdirSync(layout.emailsDir, { recursive: true });
   fs.writeFileSync(layout.outFile, 'name,email,website,link\n');
   assert.match(previewFile(input, layout, null, false), /would scrape all 3 sites again/);
+  assert.match(previewFile(input, layout, null, false, true), /would scrape 1 new sites; 2 cached sites reused/);
   assert.equal(fs.readdirSync(layout.cacheDir).sort().join(), 'list.jsonl', 'nothing written, no lock taken');
+  writeCacheAtomic(cf.cache, [site('https://a.nz/'), site('https://b.nz/'), site('https://c.nz/')]);
+  assert.match(previewFile(input, layout, null, false, true), /nothing new \(all 3 sites cached\)/);
 
   fs.writeFileSync(path.join(layout.cacheDir, 'gone.inprogress'), '1');
   fs.writeFileSync(path.join(layout.cacheDir, 'list.lock'), '999999999');

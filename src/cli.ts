@@ -1,4 +1,4 @@
-export const BOOLEAN_FLAGS = ['force', 'retry-failed', 'retry-rate-limited', 'retry-capped', 'summary-only', 'quick', 'unique', 'dry-run', 'check-mx', 'help'];
+export const BOOLEAN_FLAGS = ['force', 'retry-failed', 'retry-rate-limited', 'retry-capped', 'summary-only', 'new-only', 'quick', 'unique', 'dry-run', 'check-mx', 'help'];
 export const INTEGER_FLAGS = ['max-pages', 'browser-pages', 'max-depth', 'concurrency', 'page-concurrency', 'host-concurrency'];
 export const NUMBER_FLAGS = ['budget']; // minutes, may be fractional
 export const OPTIONAL_NUMBER_FLAGS = ['retry-budget-queued']; // a flag that may carry minutes: --x, --x=60 or --x 60
@@ -8,7 +8,7 @@ export const STRING_FLAGS = ['log-level'];
 export const USAGE = `Usage: npm run scrape -- [options] [websites/<category>/<list>.csv ...]
 
 With no files, scrapes every list under websites/ that has no output yet (and resumes interrupted ones).
-Named files are always scraped again.
+Named files are always scraped again, unless --new-only is given.
 
 Crawl limits (defaults: deep crawl)
   --quick                    lighter crawl: 150 pages, 30 browser pages, 10 min per site
@@ -22,6 +22,7 @@ Crawl limits (defaults: deep crawl)
 
 Re-running and retrying (they reuse the cache and can be combined)
   --force                    scrape every list again, even those with an output
+  --new-only                 keep the cache and scrape only the sites not cached yet (for a list that grew)
   --retry-failed             crawl again the sites that failed with no emails
   --retry-rate-limited       fetch the pages servers refused with HTTP 429/503
   --retry-budget-queued[=MIN]  continue sites that ran out of time, from their saved queue

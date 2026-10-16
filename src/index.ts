@@ -32,9 +32,12 @@ async function main() {
   const retry = retryOpts.failed || retryOpts.rateLimited || retryOpts.budget || retryOpts.capped ? retryOpts : null;
   const summaryOnly = flags.has('summary-only'); // rebuild CSV + summary log from the cache, no scraping
   if (summaryOnly && retry) throw new Error(`--summary-only rebuilds outputs without crawling; it can't be used with --${RETRY_FLAGS.filter((f) => flags.has(f)).join(', --')}`);
+  const newOnly = flags.has('new-only'); // keep the cache, scrape only the sites in the input that aren't in it
+  if (newOnly && flags.has('force')) throw new Error("--new-only keeps the cache and --force scrapes everything again; use one");
+  if (newOnly && summaryOnly) throw new Error("--summary-only rebuilds outputs without crawling; it can't be used with --new-only");
   const dryRun = flags.has('dry-run');
   if (flags.has('unique')) {
-    const other = ['force', ...RETRY_FLAGS, 'summary-only', 'quick', 'check-mx', 'dry-run'].filter((f) => flags.has(f));
+    const other = ['force', 'new-only', ...RETRY_FLAGS, 'summary-only', 'quick', 'check-mx', 'dry-run'].filter((f) => flags.has(f));
     if (other.length) throw new Error(`--unique only combines existing outputs; it can't be used with --${other.join(', --')}`);
     runUnique(fileArgs);
     return;
@@ -79,7 +82,7 @@ async function main() {
     if (!fs.existsSync(f)) { log.error({ input: f }, `Not found: ${f}`); failedFiles++; continue; }
     const interrupted = fs.existsSync(cacheFiles(layout.cacheDir, layout.base).marker);
     const hasOutput = fs.existsSync(layout.outFile);
-    if (!files.length && !force && !retry && !summaryOnly && hasOutput && !interrupted) {
+    if (!files.length && !force && !newOnly && !retry && !summaryOnly && hasOutput && !interrupted) {
       log.info({ input: path.relative(ROOT, f) }, `Skipping ${path.relative(IN_DIR, f)} (output exists; use --force)`);
       continue;
     }
@@ -89,11 +92,11 @@ async function main() {
       continue;
     }
     if (dryRun) {
-      log.info({ input: path.relative(ROOT, f) }, previewFile(f, layout, retry, summaryOnly));
+      log.info({ input: path.relative(ROOT, f) }, previewFile(f, layout, retry, summaryOnly, newOnly));
       continue;
     }
     try {
-      await withLogContext({ file: layout.id }, () => processFile(f, layout, opts, retry, summaryOnly));
+      await withLogContext({ file: layout.id }, () => processFile(f, layout, opts, retry, summaryOnly, newOnly));
     } catch (err) {
       // One unreadable or broken file never stops the others.
       failedFiles++;

@@ -36,6 +36,7 @@ Standard procedure:
 | Scrape new input files | `npm run scrape` |
 | Scrape specific files (always re-scrapes) | `npm run scrape -- websites/dealers/a.csv` |
 | Re-scrape everything | `npm run scrape -- --force` |
+| Scrape only the sites added to a list that was already scraped (cache kept) | `npm run scrape -- --new-only websites/dealers/a.csv` |
 | Re-scrape only failed sites (no emails) | `npm run scrape -- --retry-failed` |
 | Fetch the pages servers refused with 429/503 | `npm run scrape -- --retry-rate-limited` |
 | Continue sites that ran out of time budget | `npm run scrape -- --retry-budget-queued=60` |

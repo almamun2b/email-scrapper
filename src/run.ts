@@ -160,8 +160,11 @@ function writeSummary(layout: FileLayout, sites: string[], done: Map<string, Sit
   log.info({ sites: sites.length, withEmails: withEmails.length, noEmails: noEmails.length, failed: failed.length, uniqueEmails, shared: out.shared.length, failures: Object.fromEntries(reasons) }, '\n' + text);
 }
 
-/** `retry` is set for a --retry-* run: only the sites it selects are crawled, the rest come from the cache. */
-export async function processFile(file: string, layout: FileLayout, opts: RunOptions, retry: RetryFlags | null, summaryOnly = false): Promise<void> {
+/**
+ * `retry` is set for a --retry-* run: only the sites it selects are crawled, the rest come from the cache.
+ * `newOnly` keeps the cache of a finished run too, so only sites that aren't in it are crawled.
+ */
+export async function processFile(file: string, layout: FileLayout, opts: RunOptions, retry: RetryFlags | null, summaryOnly = false, newOnly = false): Promise<void> {
   const startedAt = Date.now();
   const { base, outFile } = layout;
   fs.mkdirSync(layout.cacheDir, { recursive: true, mode: 0o700 });
@@ -192,7 +195,7 @@ export async function processFile(file: string, layout: FileLayout, opts: RunOpt
     }
 
     if (!summaryOnly) {
-      const { resumed, rotatedTo } = beginScrape(cf, fs.existsSync(outFile), !!retry);
+      const { resumed, rotatedTo } = beginScrape(cf, fs.existsSync(outFile), !!retry || newOnly);
       if (resumed) log.info({ cacheFile: rel(cf.cache) }, `${layout.id}: resuming an interrupted scrape from the cache`);
       if (rotatedTo) log.info({ previousCache: rel(rotatedTo) }, `${layout.id}: previous cache kept as ${rel(rotatedTo)}`);
       ensureTrailingNewline(cf.cache);
@@ -212,6 +215,7 @@ export async function processFile(file: string, layout: FileLayout, opts: RunOpt
       log.info({ recrawl: plan.recrawl.size, resume: plan.resume.size }, `${layout.id}: retrying ${plan.recrawl.size + plan.resume.size} site(s): ${plan.recrawl.size} crawled again from the start, ${plan.resume.size} continued from where they stopped`);
     }
     log.info({ input: rel(file), sites: sites.length, cached: done.size }, `\n=== ${layout.id}: ${sites.length} sites (${done.size} cached) ===`);
+    if (newOnly && !summaryOnly) log.info({ new: sites.filter((s) => !done.has(s)).length }, `${layout.id}: --new-only: ${sites.filter((s) => !done.has(s)).length} new site(s) to scrape, the cached ones are kept`);
 
     let n = sites.filter((s) => done.has(s)).length;
     const limit = pLimit(opts.concurrency);
@@ -346,7 +350,7 @@ export function runUnique(fileArgs: string[]): void {
 }
 
 /** --dry-run: what processFile would do with one file. Reads the input and cache; writes nothing and takes no lock. */
-export function previewFile(file: string, layout: FileLayout, retry: RetryFlags | null, summaryOnly: boolean): string {
+export function previewFile(file: string, layout: FileLayout, retry: RetryFlags | null, summaryOnly: boolean, newOnly = false): string {
   const cf = cacheFiles(layout.cacheDir, layout.base);
   let input: ReturnType<typeof readSites>;
   try {
@@ -373,6 +377,7 @@ export function previewFile(file: string, layout: FileLayout, retry: RetryFlags 
     const plan = planRetries(inInput, retry);
     return `${layout.id}: would re-crawl ${plan.recrawl.size} and continue ${plan.resume.size} of ${n} sites${n - cached ? `, and scrape ${n - cached} not scraped yet` : ''}${skipped}`;
   }
+  if (newOnly) return `${layout.id}: ${n - cached ? `would scrape ${n - cached} new sites; ${cached} cached sites reused` : `nothing new (all ${n} sites cached); would only rebuild the CSV and summary`}${skipped}`;
   if (interrupted) return `${layout.id}: would resume an interrupted scrape: ${cached} of ${n} sites cached, ${n - cached} to scrape${skipped}`;
   if (hasOutput) return `${layout.id}: would scrape all ${n} sites again (the current cache is kept as ${layout.base}.<time>.jsonl)${skipped}`;
   return `${layout.id}: would scrape ${n - cached} sites${cached ? ` (${cached} more already cached by an earlier run)` : ''}${skipped}`;
