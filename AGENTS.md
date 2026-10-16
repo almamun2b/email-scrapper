@@ -41,6 +41,7 @@ Standard procedure:
 | Fetch the pages servers refused with 429/503 | `npm run scrape -- --retry-rate-limited` |
 | Continue sites that ran out of time budget | `npm run scrape -- --retry-budget-queued=60` |
 | Continue sites that reached the page cap | `npm run scrape -- --retry-capped --max-pages=800` |
+| Ask again about stored pages older than N days (default 30); with no number, about every stored page once | `--revalidate=N` / `--revalidate` |
 | Show what a command would do, without running it | add `--dry-run` |
 | Drop emails whose domain can't receive mail (DNS only) | add `--check-mx` (e.g. with `--summary-only`) |
 | List every option | `npm run scrape -- --help` |
@@ -52,7 +53,7 @@ Standard procedure:
 | Lighter, faster crawl (150 pages, 10 min/site) | `npm run scrape -- --quick` |
 | Tune limits (any combination) | `--max-pages=N --browser-pages=N --max-depth=N --budget=MIN --concurrency=N --page-concurrency=N --host-concurrency=N` |
 
-Deep crawl is the default: 400 pages, 60 browser pages, unlimited depth (`--max-depth=0`), 20 min per site. Use it for dealer, tourism and other large-site lists. Use `--quick` only when the owner wants speed over coverage. All flags are documented in README.md under "Crawl options".
+Deep crawl is the default: no page cap (`--max-pages=0`), 60 browser pages, unlimited depth (`--max-depth=0`), 20 min per site. Use it for dealer, tourism and other large-site lists. Use `--quick` only when the owner wants speed over coverage. All flags are documented in README.md under "Crawl options".
 
 Run `npm run typecheck` and `npm test` after every change, and add a test for each fix in `test/` (crawler tests use the local server in `test/helpers/server.ts`). For a quick look at one real site or snippet, use a throwaway `.mts` script (ESM, top-level `await` allowed) run with `npx tsx`, and put it outside the repo:
 
@@ -66,7 +67,7 @@ console.log(r.error, r.pages, r.emails);
 await closeBrowser();
 ```
 
-Regression baseline: `https://lumino.co.nz/` gives 6 emails with the deep defaults (3 with `QUICK_OPTIONS`), including `craig.kirkland@lumino.co.nz` named "Craig Kirkland". `https://adhb.health.nz/` gives `robots-disallowed`.
+Regression baseline: `https://lumino.co.nz/` gives 11 emails with the deep defaults, which have no page cap (it was 6 when the cap was 400; 3 with `QUICK_OPTIONS`), including `craig.kirkland@lumino.co.nz` named "Craig Kirkland". `https://adhb.health.nz/` gives `robots-disallowed`.
 
 After changing anything in `extract.ts`, run `npx tsx scripts/recheck-cache.ts` and review the dropped emails and removed or changed names against the 13k cached rows. Look for lost real people as well as junk that got through.
 
@@ -77,7 +78,7 @@ For an end-to-end check, write a 2–4 row sample CSV outside `websites/` and ru
 - **Output columns are exactly `name,email,website,link`.** `website` is the input URL and `link` is the page the email was found on. `name` falls back in this order: person name, then department page title, then the input's own name column, then the scraped business name (owner decision 2026-10-13).
 - **Each email is credited to the site that owns it** (its domain), else where it wasn't only in raw HTML, else the first site. **Emails on 3+ sites that none of them owns go to `emails/<category>/shared/<name>.csv`** (same columns), not the main CSV (owner decision 2026-10-13).
 - **A re-crawled site keeps its old row; only new emails are added** (owner decision 2026-10-13).
-- **Never delete any `emails/<category>/.cache/`.** The owner keeps it for future improvements. A fresh re-scrape renames the old cache to `<name>.<timestamp>.jsonl`; nothing deletes it.
+- **Never delete any `emails/<category>/.cache/`.** The owner keeps it for future improvements. A fresh re-scrape renames the old cache to `<name>.<timestamp>.jsonl`; nothing deletes it. The same goes for `emails/<category>/.cache/.pages`, the pages every list of the category has fetched (a page is never scraped twice; stored pages are revalidated after 30 days, `--revalidate=N` changes that). It is only appended to; never delete or edit it, and never delete `.pages.lock` while its PID is alive.
 - **Don't re-scrape existing outputs unless asked.** Code changes apply to future runs; the owner decides when to re-run. That includes `--summary-only`: it rebuilds existing CSVs with the current rules, so only run it when asked.
 - **Respect robots.txt**, including on the host reached after a redirect, on every redirect hop, on the site's `www.`/`http:` variants (each origin by its own robots.txt), and in the browser fallback, Crawl-delay included. Don't add bypasses.
 - **Each summary is appended** to `emails/<category>/logs/<name>.log` after every run. Keep that behaviour for any new mode.

@@ -2,11 +2,11 @@ import fs from 'node:fs';
 import path from 'node:path';
 import type { LevelWithSilent } from 'pino';
 import { cacheFiles, LockedError } from './cache.js';
-import { parseArgs, rawFlag, RETRY_FLAGS, retryOptions, USAGE } from './cli.js';
+import { DEFAULT_REVALIDATE_DAYS, parseArgs, rawFlag, RETRY_FLAGS, retryOptions, USAGE } from './cli.js';
 import { closeBrowser, DEFAULT_OPTIONS, QUICK_OPTIONS, setHostConcurrency } from './crawler.js';
 import { initFileLogging, installProcessHandlers, log, LOG_DIR, parseLevel, runId, withLogContext } from './logger.js';
 import { categoryOf, fileLayout, findInputs, groupOf, IN_DIR, OUT_DIR, ROOT } from './paths.js';
-import { describe, fmtDuration, previewFile, processFile, runUnique, staleState, type RunOptions } from './run.js';
+import { closePages, describe, fmtDuration, previewFile, processFile, runUnique, staleState, type RunOptions } from './run.js';
 
 async function main() {
   const startedAt = Date.now();
@@ -37,7 +37,7 @@ async function main() {
   if (newOnly && summaryOnly) throw new Error("--summary-only rebuilds outputs without crawling; it can't be used with --new-only");
   const dryRun = flags.has('dry-run');
   if (flags.has('unique')) {
-    const other = ['force', 'new-only', ...RETRY_FLAGS, 'summary-only', 'quick', 'check-mx', 'dry-run'].filter((f) => flags.has(f));
+    const other = ['force', 'new-only', ...RETRY_FLAGS, 'summary-only', 'quick', 'check-mx', 'revalidate', 'dry-run'].filter((f) => flags.has(f));
     if (other.length) throw new Error(`--unique only combines existing outputs; it can't be used with --${other.join(', --')}`);
     runUnique(fileArgs);
     return;
@@ -52,6 +52,7 @@ async function main() {
     pageConcurrency: Math.max(1, values.get('page-concurrency') ?? base.pageConcurrency),
     hostConcurrency: Math.max(1, values.get('host-concurrency') ?? 3),
     checkMx: flags.has('check-mx'),
+    revalidateDays: flags.has('revalidate') ? values.get('revalidate') ?? 0 : DEFAULT_REVALIDATE_DAYS,
   };
   setHostConcurrency(opts.hostConcurrency);
   log.info({ argv: process.argv.slice(2), options: opts, node: process.version, logDir: path.relative(ROOT, LOG_DIR) }, `Run ${runId} started (pid ${process.pid})`);
@@ -109,12 +110,16 @@ async function main() {
     log.info('Dry run: nothing was scraped or written');
     return 0;
   }
-  await closeBrowser();
+  await shutdown();
   log.info({ durationMs: Date.now() - startedAt, failedFiles }, `Run ${runId} finished in ${fmtDuration(Date.now() - startedAt)}${failedFiles ? `; ${failedFiles} file(s) failed` : ''}`);
   return failedFiles ? 1 : 0;
 }
 
-installProcessHandlers(closeBrowser);
+const shutdown = async () => {
+  closePages();
+  await closeBrowser();
+};
+installProcessHandlers(shutdown);
 main().then(
   (code) => process.exit(code ?? 0),
   (err) => {

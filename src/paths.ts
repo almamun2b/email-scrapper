@@ -17,6 +17,8 @@ export interface FileLayout {
   logDir: string;
   uniqueDir: string;
   sharedFile: string; // emails found on many sites that don't own them (assignRows)
+  pagesFile: string; // every page the category has fetched, shared by all its lists (PageStore)
+  pagesLock: string; // PID of the run using pagesFile
 }
 
 /** Folder inside a group that holds its output CSVs (emails/<group>/emails/*.csv). */
@@ -57,6 +59,9 @@ export function fileLayout(group: string, base: string, outDir = OUT_DIR): FileL
     logDir: path.join(groupDir, 'logs'),
     uniqueDir: path.join(groupDir, 'unique'),
     sharedFile: path.join(groupDir, 'shared', `${base}.csv`),
+    // dotted, so no list's own cache files (`<base>.jsonl`, `<base>.lock`) can share these names
+    pagesFile: path.join(groupDir, '.cache', '.pages'),
+    pagesLock: path.join(groupDir, '.cache', '.pages.lock'),
   };
 }
 

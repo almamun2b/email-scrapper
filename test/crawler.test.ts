@@ -1,6 +1,8 @@
 import { after, test } from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
 import { gzipSync } from 'node:zlib';
 import { chromium } from 'playwright';
 import { page, startServer, type Route } from './helpers/server.js';
@@ -9,6 +11,7 @@ import { makeBrowserFetcher } from '../src/browser.js';
 import { failedRetry } from '../src/cache.js';
 import { closeBrowser, mergeResults, resumeSite, scrapeSite, type SiteResult } from '../src/crawler.js';
 import { hostGapMs, httpGet, resetHostPacing, setCrawlDelay } from '../src/http.js';
+import { PageStore } from '../src/pages.js';
 
 after(() => closeBrowser());
 
@@ -575,6 +578,233 @@ test('frames, iframes and meta refresh lead to pages (F5)', async () => {
   try {
     const r = await scrapeSite(s.url + '/', NO_BROWSER);
     assert.deepEqual(emailsOf(r), ['hello@acme.co.nz', 'staff@acme.co.nz']);
+  } finally {
+    await s.close();
+  }
+});
+
+// ---------- a page is scraped once per category ----------
+
+const newStore = () => new PageStore(path.join(fs.mkdtempSync(path.join(os.tmpdir(), 'pages-')), '.pages'));
+const pageHits = (hits: string[]) => hits.filter((h) => h !== '/robots.txt' && !h.startsWith('/sitemap'));
+
+test('a page another site already scraped is not requested again, and its emails and links still count', async () => {
+  const s = await startServer({
+    '/': page('<a href="/contact">Contact</a><a href="/team">Team</a>'),
+    '/b': page('<a href="/contact">Contact</a><a href="/team">Team</a><a href="/b/own">Own</a>'),
+    '/contact': page('<a href="mailto:info@acme.co.nz">mail</a><a href="/deep">More</a>'),
+    '/team': page('<p>Dr Jo Bloggs jo.bloggs@acme.co.nz</p>'),
+    '/deep': page('<p>deep@acme.co.nz</p>'),
+    '/b/own': page('<p>own@acme.co.nz</p>'),
+  });
+  const pages = newStore();
+  try {
+    const a = await scrapeSite(s.url + '/', { ...NO_BROWSER, pages });
+    assert.deepEqual(emailsOf(a), ['deep@acme.co.nz', 'info@acme.co.nz', 'jo.bloggs@acme.co.nz']);
+    assert.equal(a.reused, undefined);
+    const before = s.hits.length;
+
+    const b = await scrapeSite(s.url + '/b', { ...NO_BROWSER, pages });
+    assert.deepEqual(emailsOf(b), ['deep@acme.co.nz', 'info@acme.co.nz', 'jo.bloggs@acme.co.nz', 'own@acme.co.nz'], 'it follows the links of the reused pages too');
+    assert.deepEqual(pageHits(s.hits.slice(before)), ['/b', '/b/own'], 'only what the category had not scraped yet');
+    assert.equal(b.pages, 5);
+    assert.equal(b.reused, 3);
+    for (const p of ['/contact', '/team', '/deep']) assert.equal(s.hits.filter((h) => h === p).length, 1, p);
+  } finally {
+    pages.close();
+    await s.close();
+  }
+});
+
+test('the same page under different params is one page; params that select a page stay separate', async () => {
+  const s = await startServer({
+    '/': page([
+      '/contact', '/contact/', '/contact?utm_source=fb&utm_medium=x', '/contact?fbclid=1', '/contact?q=', '/contact/index.html', '/contact#team',
+      '/list?page=2', '/list?page=3', '/list?page=2&utm_source=a',
+    ].map((h) => `<a href="${h}">x</a>`).join('')),
+    '/contact': page('<p>info@acme.co.nz</p>'),
+    '/contact/': page('<p>info@acme.co.nz</p>'),
+    '/list?page=2': page('<p>two@acme.co.nz</p>'),
+    '/list?page=3': page('<p>three@acme.co.nz</p>'),
+  });
+  try {
+    const r = await scrapeSite(s.url + '/', { ...NO_BROWSER, pages: newStore() });
+    assert.deepEqual(emailsOf(r), ['info@acme.co.nz', 'three@acme.co.nz', 'two@acme.co.nz']);
+    const wanted = pageHits(s.hits);
+    assert.equal(wanted.filter((h) => h.startsWith('/contact')).length, 1, `contact fetched once: ${wanted.join(' ')}`);
+    assert.equal(wanted.filter((h) => h === '/list?page=2').length, 1);
+    assert.equal(wanted.filter((h) => h === '/list?page=3').length, 1);
+  } finally {
+    await s.close();
+  }
+});
+
+test('sites crawled at the same time share one request for a page', async () => {
+  const s = await startServer({
+    '/a': page('<a href="/contact">Contact</a>'),
+    '/b': page('<a href="/contact">Contact</a>'),
+    '/c': page('<a href="/contact">Contact</a>'),
+    '/contact': { body: page('<p>info@acme.co.nz</p>'), delayMs: 300 },
+  });
+  const pages = newStore();
+  try {
+    const rs = await Promise.all(['/a', '/b', '/c'].map((p) => scrapeSite(s.url + p, { ...NO_BROWSER, pages })));
+    for (const r of rs) assert.deepEqual(emailsOf(r), ['info@acme.co.nz']);
+    assert.equal(s.hits.filter((h) => h === '/contact').length, 1);
+    assert.equal(rs.reduce((n, r) => n + (r.reused ?? 0), 0), 2);
+  } finally {
+    pages.close();
+    await s.close();
+  }
+});
+
+test('a page that answered 404 is not asked for again by other sites; one that failed otherwise is', async () => {
+  let n = 0;
+  const s = await startServer({
+    '/a': page('<a href="/old">Old</a><a href="/flaky">Flaky</a>'),
+    '/b': page('<a href="/old">Old</a><a href="/flaky">Flaky</a>'),
+    '/flaky': { get body() { return ++n === 1 ? '' : page('<p>flaky@acme.co.nz</p>'); }, get status() { return n === 0 ? 500 : 200; } },
+  });
+  const pages = newStore();
+  try {
+    const a = await scrapeSite(s.url + '/a', { ...NO_BROWSER, pages });
+    assert.deepEqual(emailsOf(a), []);
+    const b = await scrapeSite(s.url + '/b', { ...NO_BROWSER, pages });
+    assert.deepEqual(emailsOf(b), ['flaky@acme.co.nz']);
+    assert.equal(s.hits.filter((h) => h === '/old').length, 1);
+  } finally {
+    pages.close();
+    await s.close();
+  }
+});
+
+test('a later run of the category reuses the pages an earlier run saved on disk', async () => {
+  const s = await startServer({
+    '/a': page('<a href="/contact">Contact</a>'),
+    '/b': page('<a href="/contact">Contact</a>'),
+    '/contact': page('<p>info@acme.co.nz</p>'),
+  });
+  const file = path.join(fs.mkdtempSync(path.join(os.tmpdir(), 'pages-')), '.pages');
+  try {
+    const first = new PageStore(file);
+    await scrapeSite(s.url + '/a', { ...NO_BROWSER, pages: first });
+    first.close();
+    const second = new PageStore(file);
+    const b = await scrapeSite(s.url + '/b', { ...NO_BROWSER, pages: second });
+    second.close();
+    assert.deepEqual(emailsOf(b), ['info@acme.co.nz']);
+    assert.equal(s.hits.filter((h) => h === '/contact').length, 1);
+  } finally {
+    await s.close();
+  }
+});
+
+test('reused pages count toward --max-pages, so a site is crawled just as it would be without the store', async () => {
+  const links = Array.from({ length: 5 }, (_, i) => `<a href="/p${i}">p</a>`).join('');
+  const routes: Record<string, Route> = { '/a': page(links), '/b': page(links) };
+  for (let i = 0; i < 5; i++) routes[`/p${i}`] = page(`<p>p${i}@acme.co.nz</p>`);
+  const s = await startServer(routes);
+  const pages = newStore();
+  try {
+    const a = await scrapeSite(s.url + '/a', { ...NO_BROWSER, pages });
+    assert.equal(a.emails.length, 5);
+    const b = await scrapeSite(s.url + '/b', { ...NO_BROWSER, maxPages: 3, pages });
+    const plain = await scrapeSite(s.url + '/b', { ...NO_BROWSER, maxPages: 3 });
+    assert.deepEqual(emailsOf(b), emailsOf(plain));
+    assert.equal(b.pages, plain.pages);
+    assert.equal(b.capQueued, plain.capQueued);
+    assert.equal(b.reused, 2);
+  } finally {
+    pages.close();
+    await s.close();
+  }
+});
+
+test('resumeSite reuses pages too', async () => {
+  const s = await startServer({
+    '/a': page('<a href="/x">x</a>'),
+    '/b': page('<a href="/x">x</a>'),
+    '/x': page('<p>x@acme.co.nz</p>'),
+  });
+  const pages = newStore();
+  try {
+    await scrapeSite(s.url + '/a', { ...NO_BROWSER, pages });
+    const prev: SiteResult = { v: 3, site: s.url + '/b', finalUrl: s.url + '/b', business: 'b', emails: [], pages: 1, usedBrowser: false, resume: { queued: [[s.url + '/x', 2]], limited: [], attempts: 1 } };
+    const r = await resumeSite(prev, { budget: true, limited: false }, { ...NO_BROWSER, pages });
+    assert.deepEqual(emailsOf(r), ['x@acme.co.nz']);
+    assert.equal(r.reused, 1);
+    assert.equal(s.hits.filter((h) => h === '/x').length, 1);
+  } finally {
+    pages.close();
+    await s.close();
+  }
+});
+
+// ---------- revalidation ----------
+
+test('a stored page older than the cutoff is asked about with its validators, and a 304 keeps the stored copy', async () => {
+  const s = await startServer({
+    '/a': page('<a href="/contact">Contact</a>'),
+    '/b': page('<a href="/contact">Contact</a>'),
+    '/contact': { body: page('<p>info@acme.co.nz</p>'), headers: { etag: '"v1"' } },
+  });
+  const pages = newStore();
+  try {
+    await scrapeSite(s.url + '/a', { ...NO_BROWSER, pages });
+    // fresh enough: not asked at all
+    await scrapeSite(s.url + '/b', { ...NO_BROWSER, pages, pagesCutoff: 0 });
+    assert.equal(s.hits.filter((h) => h === '/contact').length, 1);
+
+    const b = await scrapeSite(s.url + '/b', { ...NO_BROWSER, pages, pagesCutoff: Date.now() + 1 });
+    const asks = s.hits.map((h, i) => [h, s.heads[i]['if-none-match']]).filter(([h]) => h === '/contact');
+    assert.deepEqual(asks, [['/contact', undefined], ['/contact', '"v1"']]);
+    assert.deepEqual(emailsOf(b), ['info@acme.co.nz'], 'the stored copy was kept');
+    assert.equal(b.reused, undefined, 'a revalidated page was checked against the server, not just taken from the store');
+
+    // checked just now: fresh again for the next site
+    const before = s.hits.length;
+    await scrapeSite(s.url + '/b', { ...NO_BROWSER, pages, pagesCutoff: Date.now() - 60_000 });
+    assert.deepEqual(pageHits(s.hits.slice(before)), ['/b']);
+  } finally {
+    pages.close();
+    await s.close();
+  }
+});
+
+test('a stale page that changed replaces the stored copy, and a stale 404 is asked for again', async () => {
+  const routes: Record<string, Route> = {
+    '/a': page('<a href="/contact">Contact</a><a href="/old">Old</a>'),
+    '/contact': { body: page('<p>old@acme.co.nz</p>'), headers: { etag: '"v1"' } },
+  };
+  const s = await startServer(routes);
+  const pages = newStore();
+  try {
+    assert.deepEqual(emailsOf(await scrapeSite(s.url + '/a', { ...NO_BROWSER, pages })), ['old@acme.co.nz']);
+    routes['/contact'] = { body: page('<p>new@acme.co.nz</p>'), headers: { etag: '"v2"' } };
+    routes['/old'] = page('<p>back@acme.co.nz</p>');
+    const r = await scrapeSite(s.url + '/a', { ...NO_BROWSER, pages, pagesCutoff: Date.now() + 1 });
+    assert.deepEqual(emailsOf(r), ['back@acme.co.nz', 'new@acme.co.nz']);
+    const later = await scrapeSite(s.url + '/a', { ...NO_BROWSER, pages, pagesCutoff: Date.now() - 60_000 });
+    assert.deepEqual(emailsOf(later), ['back@acme.co.nz', 'new@acme.co.nz'], 'the new copy is what is stored now');
+  } finally {
+    pages.close();
+    await s.close();
+  }
+});
+
+// ---------- no default page cap ----------
+
+test('by default a site is not cut off at a page cap', async () => {
+  const total = 430;
+  const routes: Record<string, Route> = { '/': page(Array.from({ length: total }, (_, i) => `<a href="/p${i}">p</a>`).join('')) };
+  for (let i = 0; i < total; i++) routes[`/p${i}`] = page(i === total - 1 ? '<p>last@acme.co.nz</p>' : '<p>x</p>');
+  const s = await startServer(routes);
+  try {
+    const r = await scrapeSite(s.url + '/', NO_BROWSER);
+    assert.equal(r.pages, total + 1);
+    assert.deepEqual(emailsOf(r), ['last@acme.co.nz']);
+    assert.equal(r.capQueued, undefined);
+    assert.equal(r.resume, undefined);
   } finally {
     await s.close();
   }

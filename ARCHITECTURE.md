@@ -31,7 +31,7 @@ websites/<category>/<name>.csv
         │ scrapeSite(site)
         ▼
 ┌──────────────────────── src/crawler.ts ──────────────────────┐
-│  Phase 1: crawl(start, httpFetcher, maxPages=400, sitemap)    │
+│  Phase 1: crawl(start, httpFetcher, maxPages=0 (∞), sitemap)  │
 │    tries https → http → www./bare variants until one loads    │
 │  Phase 2 (conditional): crawl(landing, browserFetcher, 60)    │
 │  businessName(homeHtml) · demoteRolePrefixes(emails)          │
@@ -125,6 +125,7 @@ Per input file, in `emails/<group>/.cache/` (the group's cache dir is passed to 
 - `<name>.jsonl`: the only file the loaders read. Sites are appended as they finish.
 - `<name>.inprogress`: written by `beginScrape()`, removed by `endScrape()` after the CSV and summary are written. If it exists at the start of a scrape, the scrape resumes from the cache instead of resetting. That's what makes an interrupted `--force` or explicit-file re-scrape resumable.
 - `<name>.<YYYYMMDD-HHMMSS>.jsonl`: when a file with an existing output is scraped again (and isn't resuming), `beginScrape()` renames the old cache to this name instead of deleting it. The owner keeps every cache for later analysis.
+- `.pages` and `.pages.lock` (one per category, not per list): the page store, see "Page store" below. Never rotated or deleted.
 - `<name>.lock`: `acquireLock()` creates it exclusively (`wx`) with the PID. A live holder raises `LockedError` and `main()` skips that file. A lock whose PID is gone is stale and taken over. Locks are released in `finally` and by a synchronous `exit` handler (the signal handlers exit through `process.exit`).
 
 A `--retry-*` run passes `keepCache` to `beginScrape()`, so the finished run's cache is reused in place, never rotated. The selection predicates never pick `robots-disallowed`:
@@ -157,11 +158,16 @@ A `--retry-*` run passes `keepCache` to `beginScrape()`, so the finished run's c
 
 The per-site state (host, robots, section, `seen`, `PageQueue`, `depthOf`, emails, `enqueue`/`ingest`) lives in a `SiteCrawl`, and the worker pool is `runQueue()`. `crawl()` builds a `SiteCrawl` from the landing page and sitemap; `resumeSite()` builds one from a saved `ResumeState`. `runQueue()` returns why it stopped: `'time'` (deadline or abort signal with pages still queued), `'cap'` (`maxPages` attempts used with pages still queued) or `'done'`. A page whose fetch the hard stop cut off goes back into the queue (its attempt is given back), so it is saved too.
 
+**Page store (`src/pages.ts`, `PageStore`).** One append-only file per category, `emails/<group>/.cache/.pages`, opened once per process by `openPages()` in `run.ts` (guarded by `.pages.lock`, closed by `closePages()` in `index.ts`). A line is `<mode><key>\t<at>\t<json>`: mode `h` (plain HTTP) or `b` (browser, never mixed with `h`), key = `pageKey()` from `urls.ts` (canonical URL without the scheme, so tracking/session/empty params, order, `www.`, trailing slash and index files don't make a different page; content params like `?page=2` do), `at` = fetch time. The last line for a key wins; `{"gone":1}` is a 404/410. Memory holds only an index of `key → offset/length/at`; records are read back on demand. A `PageRecord` is site-independent: the page's `Found` emails, its `<h1>`/`<title>` as a possible department name, its crawlable same-site links, and `etag`/`lastModified`.
+- `runQueue` calls `PageStore.load(mode, key, cutoff, fetch)`: a copy at least as new as `cutoff` is reused; a page another site is fetching right now is awaited (one request for 12 parallel sites); otherwise `fetch(stale)` runs, with the older copy so it can send `If-None-Match` / `If-Modified-Since`. A 304 re-appends the old record with a new `at`. A failed fetch is not remembered (waiting sites try themselves), except a 404/410.
+- `cutoff` is per list, in `processFile()`: `startedAt − --revalidate days` (30 by default), or `startedAt` for a fresh re-scrape of a list (output exists, not a retry/`--new-only`/resume), so pages fetched during the run are never stale in it.
+- Reused pages still count toward `--max-pages` (`attempts`), so a site's crawl is identical to one without the store; `SiteResult.reused` and the summary's `+ M reused` show how many requests were saved. The landing page is always requested (its HTML gives the business name and the JS-rendered check) but is stored for other sites. Sitemaps are memoised per run (`PageStore.sitemap`).
+
 **Limits (`CrawlOptions`).** `scrapeSite(site, options, signal?)` merges `options` over `DEFAULT_OPTIONS`:
 
 | | `DEFAULT_OPTIONS` (deep) | `QUICK_OPTIONS` |
 |---|---|---|
-| `maxPages` (HTTP attempts) | 400 | 150 |
+| `maxPages` (HTTP attempts, 0 = unlimited) | 0 | 150 |
 | `browserPages` (0 = no browser phase) | 60 | 30 |
 | `maxDepth` (0 = unlimited) | 0 | 0 |
 | `budgetMs` (soft) | 20 min | 10 min |
@@ -177,7 +183,7 @@ The per-site state (host, robots, section, `seen`, `PageQueue`, `depthOf`, email
 **`resumeSite(prev, parts, options, signal?)`** continues a saved crawl:
 - It reloads robots for `prev.finalUrl`. If the landing page is now disallowed, it returns `prev` unchanged.
 - It rebuilds `section`, seeds `seen` from `resume.seen` plus every saved queued URL, and queues only the selected parts (`parts.budget`: a time-budget queue; `parts.capped`: a page-cap queue; `parts.limited`: the refused pages, whose attempts are given back). Unselected parts are carried over into the new state unchanged; a carried page-cap queue stays capped unless this pass runs out of time.
-- Page cap: the continued crawl can use `maxPages − attempts`. If that is used up, nothing is fetched and the queue is kept (the log says to raise `--max-pages`).
+- Page cap (only when `--max-pages` is set): the continued crawl can use `maxPages − attempts`. If that is used up, nothing is fetched and the queue is kept (the log says to raise `--max-pages`).
 - After the HTTP part, it runs Phase 2 from `finalUrl` if `parts.budget` and the browser is still owed (`'no-emails'` only while there are still none).
 - The earlier emails are seeded into the hit map, so new hits only add or upgrade (`merge()`). `pages` and `rateLimited` are summed, a stale `timeout` error is dropped, and a fresh `budgetQueued` / `resume` describe what is still left.
 
@@ -283,7 +289,7 @@ One shared browser runs across the whole process, with a new context per site (`
 |---|---|
 | HTTP first, browser only as fallback | Most sites are server-rendered. Chromium is about 10× slower and much heavier, so it's used only when it's likely to help |
 | Priority queue instead of plain BFS | With a page cap, contact/team pages must come first. Section bonus and penalty keep big multi-tenant sites focused |
-| Deep crawl by default (400 pages, unlimited depth) + listing penalty | Owner decision (2026-10-02). On car dealer sites the old 150-page cap was spent on stock listings, before department pages were reached. `--quick` keeps the old limits |
+| Deep crawl by default (no page cap since 2026-10-16; was 400; unlimited depth) + listing penalty | Owner decision (2026-10-02). On car dealer sites the old 150-page cap was spent on stock listings, before department pages were reached. `--quick` keeps the old limits |
 | Respect robots.txt on the final host and in the browser | User decision (2026-09-29). Domains that redirect to a host disallowing generic bots report `robots-disallowed`. A 5xx robots.txt is a disallow (RFC 9309), reported as `robots-unavailable` so it can be retried. Every page and redirect hop is checked against its own origin's rules, and Crawl-delay holds in both phases (audit 2026-10-13) |
 | Keep the Chrome user agent | Owner decision (2026-10-03). An honest bot UA would get more sites blocked |
 | Per-server concurrency limit | Many inputs can share one server. Without the limit that server rate-limits or blocks, and sites fail |

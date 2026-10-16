@@ -1,7 +1,9 @@
 export const BOOLEAN_FLAGS = ['force', 'retry-failed', 'retry-rate-limited', 'retry-capped', 'summary-only', 'new-only', 'quick', 'unique', 'dry-run', 'check-mx', 'help'];
 export const INTEGER_FLAGS = ['max-pages', 'browser-pages', 'max-depth', 'concurrency', 'page-concurrency', 'host-concurrency'];
 export const NUMBER_FLAGS = ['budget']; // minutes, may be fractional
-export const OPTIONAL_NUMBER_FLAGS = ['retry-budget-queued']; // a flag that may carry minutes: --x, --x=60 or --x 60
+export const OPTIONAL_NUMBER_FLAGS = ['retry-budget-queued', 'revalidate']; // a flag that may carry a number (minutes, days): --x, --x=60 or --x 60
+/** Stored pages older than this many days are requested again (--revalidate=DAYS). */
+export const DEFAULT_REVALIDATE_DAYS = 30;
 export const RETRY_FLAGS = ['retry-failed', 'retry-rate-limited', 'retry-budget-queued', 'retry-capped'];
 export const STRING_FLAGS = ['log-level'];
 
@@ -12,13 +14,16 @@ Named files are always scraped again, unless --new-only is given.
 
 Crawl limits (defaults: deep crawl)
   --quick                    lighter crawl: 150 pages, 30 browser pages, 10 min per site
-  --max-pages=N              plain-HTTP pages per site (400)
+  --max-pages=N              plain-HTTP pages per site (0 = unlimited, the default; the time budget stops the crawl)
   --browser-pages=N          headless-browser pages per site (60; 0 turns the browser off)
   --max-depth=N              click levels from the landing page (0 = unlimited)
   --budget=MIN               soft time budget per site, in minutes (20)
   --concurrency=N            sites in parallel (12)
   --page-concurrency=N       page requests in parallel within one site (3)
   --host-concurrency=N       requests in parallel to one server, across all sites (3)
+
+Pages already scraped (kept per category in emails/<category>/.cache/.pages; a page is never requested twice)
+  --revalidate[=DAYS]        ask again for stored pages older than DAYS days (30); with no number, for every stored page once
 
 Re-running and retrying (they reuse the cache and can be combined)
   --force                    scrape every list again, even those with an output
@@ -68,7 +73,8 @@ export function parseArgs(argv: string[]): ParsedArgs {
       const raw = inline ?? (/^\d+(\.\d+)?$/.test(argv[i + 1] ?? '') ? argv[++i] : undefined);
       if (raw === undefined) continue;
       const n = Number(raw);
-      if (raw === '' || !Number.isFinite(n) || n <= 0) throw new Error(`--${name} takes minutes > 0, got "${raw}"`);
+      const days = name === 'revalidate';
+      if (raw === '' || !Number.isFinite(n) || n < 0 || (n === 0 && !days)) throw new Error(`--${name} takes ${days ? 'days ≥ 0' : 'minutes > 0'}, got "${raw}"`);
       values.set(name, n);
     } else if (STRING_FLAGS.includes(name)) {
       const raw = inline ?? argv[++i];
@@ -105,7 +111,7 @@ export function retryOptions({ flags, values }: ParsedArgs): RetryOptions {
     throw new Error('--retry-budget-queued=MIN and --budget=MIN both set the time budget; give it once');
   }
   if (flags.has('retry-capped') && !values.has('max-pages')) {
-    throw new Error('--retry-capped continues sites that stopped at their page cap, so it needs a higher cap: add --max-pages=N (the default is 400)');
+    throw new Error('--retry-capped continues sites that stopped at their page cap, so it needs a higher cap: add --max-pages=N (0 for no cap at all)');
   }
   return { failed: flags.has('retry-failed'), rateLimited: flags.has('retry-rate-limited'), budget: flags.has('retry-budget-queued'), capped: flags.has('retry-capped'), budgetMin };
 }

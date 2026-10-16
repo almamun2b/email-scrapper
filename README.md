@@ -193,12 +193,12 @@ Progress is printed one line per site:
 The first line of every run shows the crawl options in use:
 
 ```
-Crawl options: 400 pages, 60 browser pages, depth unlimited, 20 min/site, 12 sites in parallel
+Crawl options: unlimited pages, 60 browser pages, depth unlimited, 20 min/site, 12 sites in parallel, stored pages revalidated after 30 days
 ```
 
 ## Crawl options (depth and limits)
 
-**Deep crawl is the default.** Each website gets up to 400 pages, with no limit on depth.
+**Deep crawl is the default.** Each website is crawled with no limit on pages or depth, until it runs out of links or its time budget (20 minutes).
 
 **What "depth" (level) means:** depth is how many clicks a page is from the page the crawl started on:
 
@@ -211,17 +211,18 @@ level 3   │           └── /used-cars/2019-ford-ranger-12345
 
 Pages listed in the site's `sitemap.xml` count as level 1.
 
-There is **no depth limit by default**. The crawler follows links as deep as the page budget allows. Depth only affects the order pages are visited in: shallower pages go first, and contact, about, team and department pages (sales, parts, service, finance, fleet, bookings, …) go before everything else. Listing detail pages go last, because they almost never contain an email and big sites have thousands of them. Examples are car stock (`/used-cars/<car>`, `/stock/<id>`, `/new-vehicles/<model>`), offers, news, blog and event posts.
+There is **no depth limit by default**. The crawler follows links as deep as the time budget allows. Depth only affects the order pages are visited in: shallower pages go first, and contact, about, team and department pages (sales, parts, service, finance, fleet, bookings, …) go before everything else. Listing detail pages go last, because they almost never contain an email and big sites have thousands of them. Examples are car stock (`/used-cars/<car>`, `/stock/<id>`, `/new-vehicles/<model>`), offers, news, blog and event posts.
 
 | Option | What it controls | Default (deep) | With `--quick` |
 |---|---|---|---|
-| `--max-pages=N` | Max page requests per site with plain HTTP (phase 1). When a site reaches it with pages still queued, the queue is saved, so `--retry-capped` can go deeper later | 400 | 150 |
+| `--max-pages=N` | Max page requests per site with plain HTTP (phase 1). `0` = unlimited. With a cap, a site that reaches it with pages still queued saves the queue, so `--retry-capped` can go deeper later | 0 (unlimited) | 150 |
 | `--browser-pages=N` | Max page requests per site in the headless-browser fallback (phase 2). `0` turns the fallback off | 60 | 30 |
 | `--max-depth=N` | Max click level to follow from the start page. `0` = unlimited | 0 (unlimited) | 0 (unlimited) |
 | `--budget=MIN` | Soft time budget per site in minutes. When it runs out, the site stops, keeps what it found and saves the pages it still had queued, so `--retry-budget-queued` can continue it later. A hard stop happens 4 minutes later, and it also keeps (and saves) what was found | 20 | 10 |
 | `--concurrency=N` | Websites crawled in parallel | 12 | 12 |
 | `--page-concurrency=N` | Parallel page requests within one site (HTTP phase) | 3 | 3 |
 | `--host-concurrency=N` | Parallel requests to one server, across all sites | 3 | 3 |
+| `--revalidate[=DAYS]` | Pages already scraped in the category (see [Pages are scraped once](#pages-are-scraped-once-per-category)) are asked about again when older than `DAYS` days. With no number, every stored page is asked about once in this run | 30 days | 30 days |
 | `--quick` | Preset: the lighter limits above (this was the default before deep crawl) | — | — |
 
 Numbers can be written as `--max-pages=600` or `--max-pages 600`. An explicit option always overrides the preset. For example, `--quick --max-pages=250` uses the quick limits but 250 pages.
@@ -229,7 +230,15 @@ Numbers can be written as `--max-pages=600` or `--max-pages 600`. An explicit op
 When to change them:
 - **Default (deep):** best for most lists, especially large sites such as car dealers, dealer groups, tourism operators and hospitals.
 - **`--quick`:** small business sites such as clinics and dentists, when you want results faster.
-- **`--max-pages=800 --budget=40`:** very large sites where emails are buried deep, such as big directories or council sites.
+- **`--budget=40`:** very large sites where emails are buried deep, such as big directories or council sites (there is no page cap by default; add `--max-pages=N` to set one).
+
+### Pages are scraped once per category
+
+Every page the scraper fetches is kept in `emails/<category>/.cache/.pages`, shared by all the lists of the category (`car-dealers-au` and so on) and by later runs. When any site of the category reaches a page again, with the same emails and links it gave before, the page is **not requested again**: sites of one group domain, several domains redirecting to one server, a list that grew (`--new-only`), a retry or an interrupted run all reuse it, and two sites crawled at the same time share one request. A page counts as the same page when its URL differs only by tracking or session params (`utm_*`, `fbclid`, `gclid`, `PHPSESSID`, …), empty params, param order, `#fragment`, `http`/`https`, `www.`, a trailing slash or an `index.html`. Params that choose the content (`?page=2`, `?id=7`) make a different page. A page that answered 404/410 is remembered too. Pages the headless browser rendered are kept apart from plain-HTTP ones, because the browser exists to get what HTTP can't. A site's first (landing) page is always requested, since its business name is read from it.
+
+Reused pages count toward `--max-pages`, so a site gives the same result as it would without the store; only the requests are saved. The summary shows `N pages fetched + M reused`.
+
+**Revalidation.** A stored page older than 30 days (change it with `--revalidate=DAYS`) is asked about again the next time a crawl reaches it. If the server gave an `ETag` or `Last-Modified`, the request is conditional, and a `304 Not Modified` keeps the stored copy without downloading the page. `--revalidate` with no number asks again about every stored page, once in the run, and so does scraping a list again from scratch (`--force`, or naming a file that already has an output). Revalidated pages are appended; the file is never rewritten or deleted. Only one run at a time can use a category (`.cache/.pages.lock`); a second run on it skips the file with the usual "in use by another run" error.
 - **`--max-depth=2`:** only the start page, the pages it links to, and the pages those link to. Useful for a fast, shallow sweep of a huge list.
 - **`--concurrency=6`:** a slow or unstable connection, or many sites on the same server.
 - **`--concurrency=24 --page-concurrency=4 --host-concurrency=4`:** a faster run on a good connection. Total requests in flight are at most `concurrency × page-concurrency`, and no single server gets more than `host-concurrency`. Raise the per-server number slowly: servers that see too many requests rate-limit or block.
@@ -344,7 +353,7 @@ npm run scrape -- websites/gifts/*.csv --retry-failed --retry-rate-limited --ret
 
 - **Nothing is lost.** New emails are merged into the site's earlier ones. A site still unfinished after a retry (it ran out of time again, or was refused again) saves what is left, so the same command continues it further. Parts you didn't ask for are kept for later: `--retry-rate-limited` leaves a site's time-budget queue alone, and the other way round.
 - **The budget.** `--retry-budget-queued=60` is the same as `--retry-budget-queued --budget=60`; give it one way, not both. Sites with a `Crawl-delay` need it: at 10 seconds per page, 20 minutes is only about 120 pages.
-- **The page cap still counts.** A continued site can use the rest of its `--max-pages` (400 by default). If the first crawl already used it up, the queue is kept and the log says so; raise `--max-pages` to continue.
+- **The page cap still counts.** A continued site can use the rest of its `--max-pages` (a cap only exists when you gave one; there is none by default). If the first crawl already used it up, the queue is kept and the log says so; raise `--max-pages` (`--max-pages=0` removes the cap) to continue.
 - **Up to 2000 queued pages are saved per site,** best first. Pages past that can still be found again through links.
 - **Without a file argument** the retries go through every list under `websites/` that has an output. A list never scraped is skipped (there is nothing to retry); scrape it normally first.
 - **A re-crawl never loses emails.** A site crawled again from the start (by `--retry-failed`, or a row without saved state) keeps its earlier row as it was, and only emails the re-crawl found that the row didn't have are added.
@@ -500,6 +509,8 @@ Files in `emails/<category>/.cache/` for each input `<name>`:
 | `<name>.inprogress` | A scrape of this file started and hasn't written its CSV yet. The next run resumes instead of starting over |
 | `<name>.lock` | Holds the PID of the run working on this file. A second run skips the file with an error. A lock left by a process that no longer exists is taken over automatically |
 | `<name>.<YYYYMMDD-HHMMSS>.jsonl` | An earlier run's cache, renamed aside (timestamp in UTC) when the file was scraped again from scratch. Never deleted |
+| `.pages` | Every page the category has fetched, shared by all its lists (see [Pages are scraped once](#pages-are-scraped-once-per-category)). Appended to, never rewritten, rotated or deleted. Holds personal data (emails), so it is readable by its owner only |
+| `.pages.lock` | Holds the PID of the run using the category's `.pages`; a second run on the category skips its files with an error |
 
 - **Interrupted runs resume automatically,** including interrupted `--force` and explicit-file re-scrapes. Run the same command again (or a plain `npm run scrape`) and cached sites are skipped.
 - **A fresh re-scrape keeps the old cache.** When a file with an existing output is scraped again (`--force` or an explicit file argument), its cache is renamed to `<name>.<timestamp>.jsonl` and a new one is started.
@@ -518,7 +529,7 @@ Files in `emails/<category>/.cache/` for each input `<name>`:
 - Follows `<frame>` and `<iframe>` sources on the same site, and `<meta http-equiv="refresh">` redirects, so older framed sites are crawled too.
 - Decodes pages in their declared charset (header or `<meta charset>`), so names on older `windows-1252` sites come out right.
 - Listing detail pages (car stock, offers, news and blog posts) are fetched last, and stock/product sitemaps are read after page sitemaps.
-- Limits (defaults, see [Crawl options](#crawl-options-depth-and-limits)): **400 pages per site**, unlimited depth, 3 parallel requests per site, 15 s per request, 5 MB per page, and a 20-minute budget per site (partial results are kept, and the pages still queued are saved for `--retry-budget-queued`).
+- Limits (defaults, see [Crawl options](#crawl-options-depth-and-limits)): **no page cap** (and unlimited depth), 3 parallel requests per site, 15 s per request, 5 MB per page, and a 20-minute budget per site (partial results are kept, and the pages still queued are saved for `--retry-budget-queued`).
 
 ### 2. Headless browser fallback
 
@@ -569,7 +580,7 @@ Most limits are command-line options; see [Crawl options](#crawl-options-depth-a
 
 | Constant | File | Default | Meaning |
 |---|---|---|---|
-| `DEFAULT_OPTIONS` / `QUICK_OPTIONS` | `src/crawler.ts` | 400/60/unlimited/20 min · 150/30/unlimited/10 min | Pages, browser pages, max depth, soft budget |
+| `DEFAULT_OPTIONS` / `QUICK_OPTIONS` | `src/crawler.ts` | unlimited/60/unlimited/20 min · 150/30/unlimited/10 min | Pages, browser pages, max depth, soft budget |
 | `HARD_TIMEOUT_EXTRA_MS` | `src/index.ts` | 4 min | Hard safety timeout per site = budget + this |
 | `STOP_GRACE_MS` | `src/index.ts` | 30 s | After the hard timeout, how long a site gets to return its partial results |
 | `HTTP_TIMEOUT` | `src/http.ts` | 15 s | Per-request timeout |
@@ -592,7 +603,7 @@ npx tsx scripts/given-names-report.ts 2
 ## Limitations
 
 - Emails that appear only as images, or behind contact forms, logins or CAPTCHAs, can't be extracted.
-- Very large sites are capped at 400 pages (`--max-pages`), so emails on deep pages can be missed. Contact-like pages are fetched first and listing pages last to reduce this, and `--retry-capped` can continue them later.
+- A site is limited by its 20-minute budget (and by `--max-pages` if you set one), so emails on deep pages can be missed on very large sites. Contact-like pages are fetched first and listing pages last to reduce this, and `--retry-budget-queued` / `--retry-capped` can continue them later.
 - The browser follows redirects inside Chromium, so a redirect hop there is checked against `robots.txt` only after it loads (its page is then discarded).
 - Sites whose `robots.txt` forbids generic crawlers are skipped by design.
 - Name detection is heuristic. When it isn't confident, it falls back to the business name rather than guessing. People whose first name isn't in the given-name list only get a person name when the page itself ties the name to the email.
@@ -611,6 +622,7 @@ src/
   cli.ts        Command-line parsing, validation and --help text
   input.ts      Reading the website column of an input CSV
   cache.ts      Cache file, resume marker, rotation and per-file lock
+  pages.ts      Per-category store of fetched pages (reuse, revalidation, in-flight sharing)
   output.ts     CSV rows (crediting each email to its site, shared emails), formula-safe cells, re-checking cached results
   mx.ts         --check-mx: whether an email's domain can receive mail
   abort.ts      Waits that give up when a site's time is up
