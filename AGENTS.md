@@ -49,6 +49,7 @@ Standard procedure:
 | Rebuild CSVs and logs from cache with the current rules, no network | `npm run scrape -- --summary-only` |
 | One list per category with each email once, no network (`results/<category>/emails/unique/<category>.csv`) | `npm run scrape -- --unique` |
 | Same for only some files (`results/dealers/emails/unique/au.csv`) | `npm run scrape -- --unique websites/dealers/au.*.csv` |
+| Also write only the emails whose domain ends with / doesn't end with some suffixes (`emails/filtered/<name>.<filter>.csv`; with `--unique`, `emails/unique/<label>.<filter>.csv`) | add `--include-suffix=.com,.au` / `--exclude-suffix=.gov,.edu` (quote the `[..]` form) |
 | Verbose diagnostics in `logs/` | `npm run scrape -- websites/dealers/a.csv --log-level=debug` |
 | Lighter, faster crawl (150 pages, 10 min/site) | `npm run scrape -- --quick` |
 | Tune limits (any combination) | `--max-pages=N --browser-pages=N --max-depth=N --budget=MIN --concurrency=N --page-concurrency=N --host-concurrency=N` |
@@ -80,6 +81,7 @@ For an end-to-end check, write a 2–4 row sample CSV outside `websites/` and ru
 - **A re-crawled site keeps its old row; only new emails are added** (owner decision 2026-10-13).
 - **Never delete any `results/<category>/.cache/`.** The owner keeps it for future improvements. A fresh re-scrape renames the old cache to `<name>.<timestamp>.jsonl`; nothing deletes it. The same goes for `results/<category>/.cache/.pages`, the pages every list of the category has fetched (a page is never scraped twice; stored pages are revalidated after 30 days, `--revalidate=N` changes that). It is only appended to; never delete or edit it, and never delete `.pages.lock` while its PID is alive.
 - **Don't re-scrape existing outputs unless asked.** Code changes apply to future runs; the owner decides when to re-run. That includes `--summary-only`: it rebuilds existing CSVs with the current rules, so only run it when asked.
+- **Email filters apply to outputs only** (owner decision 2026-10-23). `--include-suffix` / `--exclude-suffix` never change what is scraped or cached and never change the normal CSV; they add a file named after the filter in `emails/filtered/` (`emails/unique/` for `--unique`). A suffix matches at a dot (`.gov` does not match `x.gov.au`); include and exclude combine. A list that isn't being scraped is filtered from its cache. There is deliberately no country filter. Don't filter inside the crawler or `extract.ts`.
 - **Respect robots.txt**, including on the host reached after a redirect, on every redirect hop, on the site's `www.`/`http:` variants (each origin by its own robots.txt), and in the browser fallback, Crawl-delay included. Don't add bypasses.
 - **Each summary is appended** to `results/<category>/logs/<name>.log` after every run. Keep that behaviour for any new mode.
 - `websites/`, `results/` and `logs` are git-ignored data. Never commit them.

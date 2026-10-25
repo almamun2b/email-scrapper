@@ -5,6 +5,7 @@ import { stringify } from 'csv-stringify/sync';
 import pLimit from 'p-limit';
 import { acquireLock, beginScrape, budgetRetry, cacheFiles, endScrape, ensureTrailingNewline, loadCache, pidAlive, planRetries, writeCacheAtomic, writeFileAtomic, type RetryFlags } from './cache.js';
 import { CACHE_VERSION, mergeResults, resumeSite, scrapeSite, type CrawlOptions, type ResumeParts, type SiteResult } from './crawler.js';
+import { filterRows, filterSummary, filterTag, type SuffixFilter } from './filter.js';
 import { readSites } from './input.js';
 import { PageStore } from './pages.js';
 import { undeliverable } from './mx.js';
@@ -21,6 +22,7 @@ export interface RunOptions extends CrawlOptions {
   hostConcurrency: number; // parallel requests to one server across all sites
   checkMx?: boolean; // drop emails whose domain can't receive mail (--check-mx)
   revalidateDays: number; // stored pages older than this are requested again (--revalidate); 0 = every one, once per run
+  filter?: SuffixFilter; // --include-suffix / --exclude-suffix: also write a filtered CSV; scraping and the normal CSV are unaffected
 }
 
 /** The page stores open in this run, one per category, each holding its lock (see openPages). */
@@ -115,6 +117,55 @@ const COLUMNS = ['name', 'email', 'website', 'link'];
 function writeCsv(file: string, rows: Row[]): void {
   fs.mkdirSync(path.dirname(file), { recursive: true, mode: 0o700 });
   writeFileAtomic(file, stringify(rows, { header: true, columns: COLUMNS }));
+}
+
+/** The cached results with the current rules applied (and, with --check-mx, undeliverable domains dropped). */
+async function checkedResults(done: Map<string, SiteResult>, checkMx: boolean): Promise<{ checked: Map<string, SiteResult>; mxDropped?: string[] }> {
+  const checked = new Map([...done].map(([site, r]) => [site, recheckSite(r)]));
+  if (!checkMx) return { checked };
+  const bad = await undeliverable([...checked.values()].flatMap((r) => r.emails.map((e) => e.email)));
+  for (const [s, r] of checked) if (r.emails.some((e) => bad.has(e.email))) checked.set(s, { ...r, emails: r.emails.filter((e) => !bad.has(e.email)) });
+  return { checked, mxDropped: [...bad].sort() };
+}
+
+export const filteredPath = (layout: FileLayout, filter: SuffixFilter) => path.join(layout.filteredDir, `${layout.base}.${filterTag(filter)}.csv`);
+
+/** results/<category>/emails/filtered/<name>.<filter>.csv from a list's rows, with a block in its summary log. */
+function writeFiltered(layout: FileLayout, rows: Row[], filter: SuffixFilter): void {
+  const { kept, dropped } = filterRows(rows, filter);
+  const out = filteredPath(layout, filter);
+  writeCsv(out, kept);
+  const text = filterSummary(`${layout.id}.csv`, filter, rows.length, kept.length, dropped, path.relative(ROOT, out));
+  fs.mkdirSync(layout.logDir, { recursive: true });
+  fs.appendFileSync(path.join(layout.logDir, `${layout.base}.log`), text + '\n');
+  log.info({ output: path.relative(ROOT, out), emails: rows.length, kept: kept.length }, '\n' + text);
+}
+
+/**
+ * The filtered CSV of a list that is not scraped (it already has an output): rebuilt from its cache with the current
+ * rules and written next to the others. The normal CSV and the cache are left alone, nothing is requested.
+ */
+export async function filterFile(file: string, layout: FileLayout, opts: RunOptions): Promise<void> {
+  if (!opts.filter) return;
+  const cf = cacheFiles(layout.cacheDir, layout.base);
+  const rel = path.relative(ROOT, file);
+  if (fs.existsSync(cf.marker)) {
+    log.warn({ input: rel }, `Skipping the filter for ${layout.id}: its last scrape was interrupted. Resume it first (re-run the scrape)`);
+    return;
+  }
+  if (!fs.existsSync(cf.cache) || !fs.statSync(cf.cache).size) {
+    log.warn({ input: rel, cacheFile: path.relative(ROOT, cf.cache) }, `Skipping the filter for ${layout.id}: no cache to filter`);
+    return;
+  }
+  const release = acquireLock(cf.lock);
+  try {
+    const input = readSites(file);
+    if (!input.sites.length) return;
+    const { checked } = await checkedResults(loadCache(cf.cache), !!opts.checkMx);
+    writeFiltered(layout, assignRows(input.sites, checked, input.names).rows, opts.filter);
+  } finally {
+    release();
+  }
 }
 
 function writeSummary(layout: FileLayout, sites: string[], done: Map<string, SiteResult>, out: Assigned, mode: string, startedAt: number, mxDropped?: string[]): void {
@@ -286,13 +337,7 @@ export async function processFile(file: string, layout: FileLayout, opts: RunOpt
     );
 
     // Outputs use the current rules even for cached rows; the cache file keeps what was scraped.
-    const checked = new Map([...done].map(([site, r]) => [site, recheckSite(r)]));
-    let mxDropped: string[] | undefined;
-    if (opts.checkMx) {
-      const bad = await undeliverable([...checked.values()].flatMap((r) => r.emails.map((e) => e.email)));
-      for (const [s, r] of checked) if (r.emails.some((e) => bad.has(e.email))) checked.set(s, { ...r, emails: r.emails.filter((e) => !bad.has(e.email)) });
-      mxDropped = [...bad].sort();
-    }
+    const { checked, mxDropped } = await checkedResults(done, !!opts.checkMx);
     const assigned = assignRows(sites, checked, input.names);
     const { rows } = assigned;
     writeCsv(outFile, rows);
@@ -302,6 +347,7 @@ export async function processFile(file: string, layout: FileLayout, opts: RunOpt
     const retried = retry ? [retry.failed && 'failed', retry.rateLimited && 'rate-limited', retry.budget && 'budget-queued', retry.capped && 'capped'].filter(Boolean) : [];
     const mode = summaryOnly ? 'summary rebuilt from cache' : `${retried.length ? `retry ${retried.join(' + ')}` : 'scrape'}: ${describe(opts)}`;
     writeSummary(layout, sites, checked, assigned, mode, startedAt, mxDropped);
+    if (opts.filter) writeFiltered(layout, rows, opts.filter);
     if (!summaryOnly) endScrape(cf);
   } finally {
     release();
@@ -317,7 +363,7 @@ function readRows(file: string): Row[] {
  * --unique: every email once across the given output CSVs, written to `outFile`. Reads finished outputs only;
  * per-file CSVs and caches are left alone and nothing is scraped. `label` names the combined file and its log.
  */
-export function writeUnique(inputs: { id: string; file: string }[], label: string, outFile: string, logDir: string): void {
+export function writeUnique(inputs: { id: string; file: string }[], label: string, outFile: string, logDir: string, filter?: SuffixFilter): void {
   const startedAt = Date.now();
   const files: { base: string; rows: Row[] }[] = [];
   const missing: string[] = [];
@@ -330,6 +376,14 @@ export function writeUnique(inputs: { id: string; file: string }[], label: strin
 
   const { rows, read, overlaps } = uniqueRows(files);
   writeCsv(outFile, rows);
+  // The filter is applied to the combined list, so an email dropped from one file can't come back from another.
+  let filtered = '';
+  if (filter) {
+    const { kept, dropped } = filterRows(rows, filter);
+    const out = path.join(path.dirname(outFile), `${path.basename(outFile, '.csv')}.${filterTag(filter)}.csv`);
+    writeCsv(out, kept);
+    filtered = filterSummary(`unique ${label}`, filter, rows.length, kept.length, dropped, path.relative(ROOT, out));
+  }
 
   const top = [...overlaps].sort((a, b) => b[1] - a[1]).slice(0, 5);
   const text = [
@@ -339,7 +393,7 @@ export function writeUnique(inputs: { id: string; file: string }[], label: strin
     `  Emails   : ${rows.length} unique -> ${path.relative(ROOT, outFile)}`,
     ...(top.length ? [`  Overlap  : ${top.map(([k, n]) => `${k} ${n}`).join('; ')}`] : []),
     '',
-  ].join('\n');
+  ].join('\n') + filtered;
   fs.mkdirSync(logDir, { recursive: true });
   fs.appendFileSync(path.join(logDir, `unique.${label}.log`), text + '\n');
   log.info({ output: path.relative(ROOT, outFile), files: files.length, rowsRead: read, uniqueEmails: rows.length }, '\n' + text);
@@ -350,12 +404,12 @@ export function writeUnique(inputs: { id: string; file: string }[], label: strin
  * With files: the files' own group if they share one (results/<group>/emails/unique/<label>.csv), else a cross-group
  * list in results/unique/, the only output that lives outside a group folder.
  */
-export function runUnique(fileArgs: string[]): void {
+export function runUnique(fileArgs: string[], filter?: SuffixFilter): void {
   if (!fileArgs.length) {
     for (const [group, csvs] of findOutputs(OUT_DIR)) {
       const l = fileLayout(group, group);
       const inputs = csvs.map((file) => ({ id: path.basename(file, '.csv'), file }));
-      writeUnique(inputs, group, path.join(l.uniqueDir, `${group}.csv`), l.logDir);
+      writeUnique(inputs, group, path.join(l.uniqueDir, `${group}.csv`), l.logDir, filter);
     }
     return;
   }
@@ -369,14 +423,19 @@ export function runUnique(fileArgs: string[]): void {
   const label = uniqueLabel(uniq.map((i) => path.basename(i.file, '.csv')));
   if (groups.size === 1) {
     const l = fileLayout([...groups][0], label);
-    writeUnique(uniq, label, path.join(l.uniqueDir, `${label}.csv`), l.logDir);
+    writeUnique(uniq, label, path.join(l.uniqueDir, `${label}.csv`), l.logDir, filter);
   } else {
-    writeUnique(uniq, label, path.join(OUT_DIR, 'unique', `${label}.csv`), path.join(OUT_DIR, 'logs'));
+    writeUnique(uniq, label, path.join(OUT_DIR, 'unique', `${label}.csv`), path.join(OUT_DIR, 'logs'), filter);
   }
 }
 
 /** --dry-run: what processFile would do with one file. Reads the input and cache; writes nothing and takes no lock. */
-export function previewFile(file: string, layout: FileLayout, retry: RetryFlags | null, summaryOnly: boolean, newOnly = false): string {
+export function previewFile(file: string, layout: FileLayout, retry: RetryFlags | null, summaryOnly: boolean, newOnly = false, filter?: SuffixFilter): string {
+  const text = previewBase(file, layout, retry, summaryOnly, newOnly);
+  return filter && !/would (be )?skipped?|would fail/.test(text) ? `${text}; then would write the filtered CSV ${path.relative(ROOT, filteredPath(layout, filter))}` : text;
+}
+
+function previewBase(file: string, layout: FileLayout, retry: RetryFlags | null, summaryOnly: boolean, newOnly: boolean): string {
   const cf = cacheFiles(layout.cacheDir, layout.base);
   let input: ReturnType<typeof readSites>;
   try {

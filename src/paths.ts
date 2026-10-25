@@ -15,6 +15,7 @@ export interface FileLayout {
   outFile: string;
   cacheDir: string;
   logDir: string;
+  filteredDir: string; // the --include-suffix / --exclude-suffix CSVs of this category's lists
   uniqueDir: string;
   pagesFile: string; // every page the category has fetched, shared by all its lists (PageStore)
   pagesLock: string; // PID of the run using pagesFile
@@ -56,6 +57,7 @@ export function fileLayout(group: string, base: string, outDir = OUT_DIR): FileL
     outFile: path.join(emailsDir, `${base}.csv`),
     cacheDir: path.join(groupDir, '.cache'),
     logDir: path.join(groupDir, 'logs'),
+    filteredDir: path.join(emailsDir, 'filtered'),
     uniqueDir: path.join(emailsDir, 'unique'),
     // dotted, so no list's own cache files (`<base>.jsonl`, `<base>.lock`) can share these names
     pagesFile: path.join(groupDir, '.cache', '.pages'),

@@ -1,3 +1,5 @@
+import { parseSuffixes, type SuffixFilter } from './filter.js';
+
 export const BOOLEAN_FLAGS = ['force', 'retry-failed', 'retry-rate-limited', 'retry-capped', 'summary-only', 'new-only', 'quick', 'unique', 'dry-run', 'check-mx', 'help'];
 export const INTEGER_FLAGS = ['max-pages', 'browser-pages', 'max-depth', 'concurrency', 'page-concurrency', 'host-concurrency'];
 export const NUMBER_FLAGS = ['budget']; // minutes, may be fractional
@@ -6,6 +8,7 @@ export const OPTIONAL_NUMBER_FLAGS = ['retry-budget-queued', 'revalidate']; // a
 export const DEFAULT_REVALIDATE_DAYS = 30;
 export const RETRY_FLAGS = ['retry-failed', 'retry-rate-limited', 'retry-budget-queued', 'retry-capped'];
 export const STRING_FLAGS = ['log-level'];
+export const LIST_FLAGS = ['include-suffix', 'exclude-suffix']; // comma-separated lists: --x=a,b  --x a,b  --x[a,b]
 
 export const USAGE = `Usage: npm run scrape -- [options] [websites/<category>/<list>.csv ...]
 
@@ -38,6 +41,12 @@ Outputs without crawling
   --unique                   each email once per category -> results/<category>/emails/unique/<category>.csv
   --check-mx                 drop emails whose domain can't receive mail (DNS lookups only)
 
+Filtering outputs (by the ending of the email's domain; scraping, the cache and the normal CSV keep every email)
+  --include-suffix=.com,.au  also write a CSV with only the emails whose domain ends with one of these
+  --exclude-suffix=.gov,.edu also write a CSV without the emails whose domain ends with one of these
+                             (both together: included and not excluded; quote the [..] form: '--exclude-suffix[.gov,.de]')
+                             lists with an output already are not scraped again, only filtered from their cache
+
 Other
   --dry-run                  show what the command would do; writes nothing under results/
   --log-level=LEVEL          file log level: trace, debug, info, warn, error, fatal, silent (info)
@@ -49,6 +58,7 @@ export interface ParsedArgs {
   flags: Set<string>;
   values: Map<string, number>;
   strings: Map<string, string>;
+  lists: Map<string, string[]>;
   files: string[];
 }
 
@@ -57,13 +67,15 @@ export function parseArgs(argv: string[]): ParsedArgs {
   const flags = new Set<string>();
   const values = new Map<string, number>();
   const strings = new Map<string, string>();
+  const lists = new Map<string, string[]>();
   const files: string[] = [];
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
     if (!a.startsWith('--')) { files.push(a); continue; }
-    const eq = a.indexOf('=');
-    const name = eq < 0 ? a.slice(2) : a.slice(2, eq);
-    const inline = eq < 0 ? undefined : a.slice(eq + 1);
+    const bracket = /^--([a-z-]+)\[(.*)\]$/.exec(a); // --x[a,b], the form the owner types
+    const eq = bracket ? -1 : a.indexOf('=');
+    const name = bracket ? bracket[1] : eq < 0 ? a.slice(2) : a.slice(2, eq);
+    const inline = bracket ? bracket[2] : eq < 0 ? undefined : a.slice(eq + 1);
     if (BOOLEAN_FLAGS.includes(name)) {
       if (inline !== undefined) throw new Error(`--${name} takes no value (got "--${name}=${inline}")`);
       flags.add(name);
@@ -76,6 +88,12 @@ export function parseArgs(argv: string[]): ParsedArgs {
       const days = name === 'revalidate';
       if (raw === '' || !Number.isFinite(n) || n < 0 || (n === 0 && !days)) throw new Error(`--${name} takes ${days ? 'days ≥ 0' : 'minutes > 0'}, got "${raw}"`);
       values.set(name, n);
+    } else if (LIST_FLAGS.includes(name)) {
+      const raw = inline ?? argv[++i];
+      if (!raw) throw new Error(`--${name} needs a list such as ${name === 'include-suffix' ? '.com,.net,.au' : '.gov,.edu'}`);
+      const list = parseSuffixes(raw, name);
+      if (!list.length) throw new Error(`--${name} needs at least one suffix, got "${raw}"`);
+      lists.set(name, [...(lists.get(name) ?? []), ...list]);
     } else if (STRING_FLAGS.includes(name)) {
       const raw = inline ?? argv[++i];
       if (!raw) throw new Error(`--${name} needs a value`);
@@ -93,7 +111,7 @@ export function parseArgs(argv: string[]): ParsedArgs {
       throw new Error(`Unknown option: --${name}`);
     }
   }
-  return { flags, values, strings, files };
+  return { flags, values, strings, lists, files };
 }
 
 export interface RetryOptions {
@@ -114,6 +132,13 @@ export function retryOptions({ flags, values }: ParsedArgs): RetryOptions {
     throw new Error('--retry-capped continues sites that stopped at their page cap, so it needs a higher cap: add --max-pages=N (0 for no cap at all)');
   }
   return { failed: flags.has('retry-failed'), rateLimited: flags.has('retry-rate-limited'), budget: flags.has('retry-budget-queued'), capped: flags.has('retry-capped'), budgetMin };
+}
+
+/** The --include-suffix / --exclude-suffix filter of this run, or null when neither is given. */
+export function suffixFilter({ lists }: ParsedArgs): SuffixFilter | null {
+  const include = lists.get('include-suffix') ?? [];
+  const exclude = lists.get('exclude-suffix') ?? [];
+  return include.length || exclude.length ? { include, exclude } : null;
 }
 
 /** The raw value of one string flag, read before full validation (so logging can start first). */

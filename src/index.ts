@@ -2,12 +2,13 @@ import fs from 'node:fs';
 import path from 'node:path';
 import type { LevelWithSilent } from 'pino';
 import { cacheFiles, LockedError } from './cache.js';
-import { DEFAULT_REVALIDATE_DAYS, parseArgs, rawFlag, RETRY_FLAGS, retryOptions, USAGE } from './cli.js';
+import { DEFAULT_REVALIDATE_DAYS, parseArgs, rawFlag, RETRY_FLAGS, retryOptions, suffixFilter, USAGE } from './cli.js';
 import { ensureBrowser } from './browser.js';
 import { closeBrowser, DEFAULT_OPTIONS, QUICK_OPTIONS, setHostConcurrency } from './crawler.js';
 import { initFileLogging, installProcessHandlers, log, LOG_DIR, parseLevel, runId, withLogContext } from './logger.js';
 import { categoryOf, fileLayout, findInputs, groupOf, IN_DIR, OUT_DIR, ROOT } from './paths.js';
-import { closePages, describe, fmtDuration, previewFile, processFile, runUnique, staleState, type RunOptions } from './run.js';
+import { describeFilter } from './filter.js';
+import { closePages, describe, filteredPath, filterFile, fmtDuration, previewFile, processFile, runUnique, staleState, type RunOptions } from './run.js';
 
 async function main() {
   const startedAt = Date.now();
@@ -37,10 +38,11 @@ async function main() {
   if (newOnly && flags.has('force')) throw new Error("--new-only keeps the cache and --force scrapes everything again; use one");
   if (newOnly && summaryOnly) throw new Error("--summary-only rebuilds outputs without crawling; it can't be used with --new-only");
   const dryRun = flags.has('dry-run');
+  const filter = suffixFilter(parsed) ?? undefined; // outputs only: every email is still scraped and cached
   if (flags.has('unique')) {
     const other = ['force', 'new-only', ...RETRY_FLAGS, 'summary-only', 'quick', 'check-mx', 'revalidate', 'dry-run'].filter((f) => flags.has(f));
     if (other.length) throw new Error(`--unique only combines existing outputs; it can't be used with --${other.join(', --')}`);
-    runUnique(fileArgs);
+    runUnique(fileArgs, filter);
     return;
   }
   const base = flags.has('quick') ? QUICK_OPTIONS : DEFAULT_OPTIONS;
@@ -54,10 +56,12 @@ async function main() {
     hostConcurrency: Math.max(1, values.get('host-concurrency') ?? 3),
     checkMx: flags.has('check-mx'),
     revalidateDays: flags.has('revalidate') ? values.get('revalidate') ?? 0 : DEFAULT_REVALIDATE_DAYS,
+    filter,
   };
   setHostConcurrency(opts.hostConcurrency);
   log.info({ argv: process.argv.slice(2), options: opts, node: process.version, logDir: path.relative(ROOT, LOG_DIR) }, `Run ${runId} started (pid ${process.pid})`);
   if (!summaryOnly) log.info(`Crawl options: ${describe(opts)}`);
+  if (filter) log.info(`Filter: ${describeFilter(filter)} (applied to the outputs, from the cache; scraping still collects every email)`);
   const files = fileArgs.map((f) => path.resolve(f));
   if (!files.length && !fs.existsSync(IN_DIR)) throw new Error(`No input files given and ${path.relative(ROOT, IN_DIR)}/ does not exist`);
   const targets = (files.length ? files : findInputs(IN_DIR)).map((f) => {
@@ -82,21 +86,34 @@ async function main() {
   if (!dryRun && !summaryOnly && opts.browserPages > 0) await ensureBrowser();
   if (!dryRun) fs.mkdirSync(OUT_DIR, { recursive: true, mode: 0o700 });
   let failedFiles = 0;
+  // A list that isn't scraped this run still gets its filtered CSV, built from its cache.
+  const skipOrFilter = async (f: string, layout: (typeof targets)[number]['layout'], why: string) => {
+    if (!filter) { log.info({ input: path.relative(ROOT, f) }, why); return; }
+    if (dryRun) { log.info({ input: path.relative(ROOT, f) }, `${why}; would write the filtered CSV ${path.relative(ROOT, filteredPath(layout, filter))} from its cache`); return; }
+    log.info({ input: path.relative(ROOT, f) }, `${why}; writing its filtered CSV from the cache`);
+    try {
+      await withLogContext({ file: layout.id }, () => filterFile(f, layout, opts));
+    } catch (err) {
+      failedFiles++;
+      if (err instanceof LockedError) log.error({ input: path.relative(ROOT, f), err }, `Skipping the filter for ${path.relative(IN_DIR, f)}: ${err.message}`);
+      else log.error({ input: path.relative(ROOT, f), err }, `${path.relative(ROOT, f)} filter failed and was skipped; stack trace in logs/error-<date>.log`);
+    }
+  };
   for (const { file: f, layout } of targets) {
     if (!fs.existsSync(f)) { log.error({ input: f }, `Not found: ${f}`); failedFiles++; continue; }
     const interrupted = fs.existsSync(cacheFiles(layout.cacheDir, layout.base).marker);
     const hasOutput = fs.existsSync(layout.outFile);
     if (!files.length && !force && !newOnly && !retry && !summaryOnly && hasOutput && !interrupted) {
-      log.info({ input: path.relative(ROOT, f) }, `Skipping ${path.relative(IN_DIR, f)} (output exists; use --force)`);
+      await skipOrFilter(f, layout, `Skipping ${path.relative(IN_DIR, f)} (output exists; use --force)`);
       continue;
     }
     // A retry only redoes parts of finished scrapes; a list never scraped needs a normal run first.
     if (!files.length && retry && !hasOutput) {
-      log.info({ input: path.relative(ROOT, f) }, `Skipping ${path.relative(IN_DIR, f)} (no output yet, so nothing to retry; scrape it first)`);
+      await skipOrFilter(f, layout, `Skipping ${path.relative(IN_DIR, f)} (no output yet, so nothing to retry; scrape it first)`);
       continue;
     }
     if (dryRun) {
-      log.info({ input: path.relative(ROOT, f) }, previewFile(f, layout, retry, summaryOnly, newOnly));
+      log.info({ input: path.relative(ROOT, f) }, previewFile(f, layout, retry, summaryOnly, newOnly, filter));
       continue;
     }
     try {

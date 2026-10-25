@@ -29,6 +29,8 @@ npx tsx scripts/mark-budget-from-logs.ts         # pre-v3 rows that ran out of t
 npm run scrape -- --summary-only                 # rebuild CSVs + logs from cache with current rules, no network
 npm run scrape -- --unique                       # each email once per category -> results/<category>/emails/unique/<category>.csv; no network
 npm run scrape -- --unique websites/dealers/au.*.csv # only those files -> results/dealers/emails/unique/au.csv
+npm run scrape -- --include-suffix=.com,.au      # also write emails/filtered/<name>.<filter>.csv with only those domain endings (from the cache; scraping and the normal CSV keep every email)
+npm run scrape -- '--exclude-suffix[.gov,.edu]'   # the other way round; both flags combine; with --unique the filter applies to the combined list
 npm run scrape -- --quick                        # lighter crawl (150 pages, 10 min/site); default is deep
 npm run scrape -- x.csv --log-level=debug        # also log every failed request to logs/scraper-<date>.log
 npm run scrape -- x.csv --max-pages=600 --max-depth=3 --budget=30 --browser-pages=80 --concurrency=8 --page-concurrency=3 --host-concurrency=3
@@ -58,6 +60,7 @@ Pipeline: `index.ts` (command line, file selection) → `run.ts` (per-file orche
   - A global browser page limit of 4.
   - Each site has a soft budget (`--budget`, 20 min) that keeps partial results, plus a hard timeout of budget + 4 min in `run.ts` that aborts the site's `AbortSignal` and still keeps what it found. Slot waits give up on abort (`untilAborted()`), and if a site still won't stop, the result from before its browser phase (`onPartial`) is kept.
 - **Naming precedence:** `name || pageTitle || input name column || business`. Person names are deliberately conservative. `consistentPerson()` keeps a scraped name only if it matches whole tokens of the email's local part (or it has a title like Dr). `nameFromLocal()` needs a first part from `src/data/given-names.txt` and no `DEPT_WORDS`. `demoteRolePrefixes()` clears per-branch role mailboxes (`bec.<city>@`). A wrong person name is considered worse than a business name.
+- **Suffix filters (`filter.ts`) apply to outputs only.** `--include-suffix` / `--exclude-suffix` never touch the crawl or cache. `processFile()` writes the full CSV, then `emails/filtered/<name>.<tag>.csv`; a list that isn't scraped this run goes through `filterFile()` (cache only); `writeUnique()` filters the combined list. A suffix matches at a dot (`.gov` ≠ `.gov.au`). No country filter, by the owner's decision.
 - **CSV rows are unique by email per file** (`assignRows()` in `output.ts`): each email is credited to the input site owning its domain, else the first site where it wasn't only in raw HTML, else the first site. Across files rows repeat when input lists overlap; `--unique` (`uniqueRows()`) writes the combined list. `link` is the first page the email was seen on, upgraded only to a page that yields a person name (`merge()`).
 
 ## Gotchas
