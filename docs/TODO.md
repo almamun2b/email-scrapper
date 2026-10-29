@@ -6,7 +6,43 @@ Status (2026-10-29): the rules ("Building website lists" in AGENTS.md), `scripts
 
 Existing lists to extend (never edit these): `websites/pizza-au/pizza-shops.au.csv` (513), `pizza-chains.au.csv` (12), `websites/pizza-nz/pizza-shops.nz.csv` (88), `pizza-chains.nz.csv` (8).
 
-Run locally, from the repo root, with Node 22+ and `npm install` done:
+### Set up the project locally (once)
+
+There is no config file or `.env`; the setup is installing dependencies. You need Node 22+ and git.
+
+```bash
+git clone https://github.com/almamun2b/email-scrapper.git
+cd email-scrapper
+git checkout scrapping-websites
+```
+
+```bash
+npm install
+```
+
+```bash
+npx playwright install chromium
+```
+
+Check that it works:
+
+```bash
+npm run typecheck
+```
+
+```bash
+npm test
+```
+
+- `npx playwright install chromium` is only needed for email scraping (the browser fallback), not for generating lists.
+- The `websites/` input lists are tracked in git, so they come with the clone. `results/` is git-ignored and starts empty on a new machine.
+- If Chromium fails to start with a sandbox error on Linux, see "Headless browser sandbox" in README.md (`SCRAPER_NO_SANDBOX=1` is the opt-out).
+- Every crawl option is a command-line flag: `npm run scrape -- --help`.
+- Git: commit with your own git config. Claude adds no `Co-Authored-By` or session lines (see CLAUDE.md "Git commits").
+
+### Generate the lists
+
+Run from the repo root once the setup above is done.
 
 1. Fetch candidates (about 10–30 minutes per country, one Overpass query per state or region, retries across mirrors; the `NODE_USE_ENV_PROXY=1` prefix is only needed behind an HTTP proxy):
    ```bash
