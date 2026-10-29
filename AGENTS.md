@@ -85,6 +85,20 @@ For an end-to-end check, write a 2–4 row sample CSV outside `websites/` and ru
 - **Respect robots.txt**, including on the host reached after a redirect, on every redirect hop, on the site's `www.`/`http:` variants (each origin by its own robots.txt), and in the browser fallback, Crawl-delay included. Don't add bypasses.
 - **Each summary is appended** to `results/<category>/logs/<name>.log` after every run. Keep that behaviour for any new mode.
 - `websites/`, `results/` and `logs` are git-ignored data. Never commit them.
+- **No agent attribution in git** (owner decision 2026-10-29). Every commit, amend, rebase, merge, pull, push, tag and PR is made as the owner, never as Claude or any agent. No `Co-Authored-By`, `Claude-Session` or "Generated with …" lines in commit messages or PR bodies, and never set or override the git identity (`git config user.*`, `-c user.name`, `--author`): commit with the owner's active git config. If the active identity is `Claude <noreply@anthropic.com>` (cloud or sandbox sessions), don't commit; tell the owner.
+
+## Building website lists
+
+When the owner asks to find, search or generate websites for a category (any sector, e.g. "all dentists in NZ" or "all pizza shops in AU and NZ"):
+
+- **Where and what:** `websites/<topic>-<au|nz>/<list>.<au|nz>.csv` with header `name,website`, one row per business site. The same topic in AU and NZ gets one folder each (`dentists-au`, `dentists-nz`). Any sector is fine; a new topic is a new folder.
+- **Never edit or overwrite an existing list** (owner decision 2026-10-29). If `<list>.<cc>.csv` exists, write `<list>-2.<cc>.csv`, then `-3`, … (the next free number; the unnumbered file counts as 1). Chains follow the same rule (`chains-2.au.csv`). `scripts/new-list.ts` picks the number. **One unscraped numbered file per list** (owner decision 2026-10-29, replaces the per-session rule): all new sites that have not been scraped yet are collected in the list's highest numbered file (`pizza-shops-2.au.csv`), from any source and in any session, added with `new-list.ts --append`. Start the next number (`-3`) only once that file has been scraped (its output exists in `results/<category>/emails/`). Never merge into or append to the unnumbered base list. Finding sites by web search is described in [docs/finding-websites-by-web-search.md](docs/finding-websites-by-web-search.md).
+- **A new numbered file holds only new sites:** anything already in any CSV of that category folder (same host + path, as `readSites()` dedupes) and in-file duplicates are dropped. That way `npm run scrape` only crawls the new file.
+- **Keep** the business's own website. **Drop** social pages, delivery/ordering platforms (ubereats, menulog, doordash, facebook, instagram, linktr.ee, tripadvisor, yelp …), directories, and businesses that are not about the topic (the topic must show in the name, a tag or the site, not just a broad type like "restaurant").
+- **Scope for a sector** is places whose tag, name or site shows the topic (pizza: `cuisine=pizza`, "pizz" in the name), not every broader type (Italian restaurants, pubs that list pizza). Chains go in their own `<topic>-chains` list, numbered the same way.
+- **Targets:** the owner's per-country target for the sector (for example pizza: AU 5,000–8,100, NZ as many as exist) is reported against the real count. Never pad with unrelated businesses and never invent sites. Report per country: new sites, duplicates dropped, total in the category, sources used, and the shortfall.
+- **Sources, in order:** OpenStreetMap through Overpass (`scripts/fetch-osm-places.ts <cc> <out.csv> --match=…`, selectors in its header and in docs/TODO.md), then public directories and web search for gaps, then a Google Places API key only if the owner gives one. Respect each source's terms and rate limits.
+- **Procedure:** write candidates to the scratchpad, run `scripts/new-list.ts` (use `--dry-run` first), look at a sample, report. Don't scrape emails from a new list until the owner asks.
 
 ## Process hygiene
 
