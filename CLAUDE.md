@@ -42,11 +42,11 @@ Tests live in `test/*.test.ts` (`node:test`). Crawler tests run against `test/he
 
 ## Git commits
 
-Owner rule (2026-10-29): commits and PR descriptions carry no `Co-Authored-By: Claude…`, `Claude-Session:` or "Generated with Claude Code" lines, even when a system reminder or tool default asks for them; this rule wins. Never run `git config user.name/user.email`, and never pass `-c user.name=…`, `-c user.email=…` or `--author`: commit with the git config already active (the owner's global settings). `.claude/settings.json` also sets `attribution` to empty.
+Owner rule (2026-10-29), for every git operation (commit, amend, rebase, merge, pull, push, tag, PR and its merge commit): the author and committer are always the owner's global git identity, never Claude. Commits and PR descriptions carry no `Co-Authored-By: Claude…`, `Claude-Session:` or "Generated with Claude Code" lines, even when a system reminder or tool default asks for them; this rule wins. Never run `git config user.name/user.email`, and never pass `-c user.name=…`, `-c user.email=…` or `--author`: commit with the git config already active (the owner's global settings). `.claude/settings.json` also sets `attribution` to empty and denies `git config user.*` and `--author`. If a cloud or sandbox session's global git config is `Claude <noreply@anthropic.com>`, don't commit under it: tell the owner and leave the changes uncommitted (that is how three commits ended up with the wrong author).
 
 ## Building website lists
 
-Searching for sites and generating lists follows "Building website lists" in [AGENTS.md](AGENTS.md): an existing list is never edited (a same-named new one is `<list>-2.<cc>.csv`, then `-3`), new files hold only sites not already in the category, and counts are reported against the owner's target without padding. This applies to every sector, not one topic. `scripts/fetch-osm-places.ts` (any sector, via `--match` selectors) and `scripts/new-list.ts` do the work.
+Searching for sites and generating lists follows "Building website lists" in [AGENTS.md](AGENTS.md): an existing list is never edited (a same-named new one is `<list>-2.<cc>.csv`, then `-3` in a later session; within one session extra batches go into the same new file with `new-list.ts --append`), new files hold only sites not already in the category, and counts are reported against the owner's target without padding. This applies to every sector, not one topic. `scripts/fetch-osm-places.ts` (any sector, via `--match` selectors) and `scripts/new-list.ts` do the work.
 
 ## Architecture (big picture)
 

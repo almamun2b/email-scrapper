@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { buildList, isBlocked, nextListName } from '../scripts/new-list.js';
+import { buildList, currentListName, isBlocked, nextListName } from '../scripts/new-list.js';
 
 const tmp = () => fs.mkdtempSync(path.join(os.tmpdir(), 'scraper-newlist-'));
 
@@ -43,4 +43,26 @@ test('isBlocked: matches the registrable domain, not lookalikes', () => {
   assert.equal(isBlocked('https://m.facebook.com/x'), true);
   assert.equal(isBlocked('https://www.menulog.com.au/'), true);
   assert.equal(isBlocked('https://facebookpizza.com.au/'), false);
+  assert.equal(isBlocked('https://venues.posbosshq.com/NZ/my-store-4867'), true);
+  assert.equal(isBlocked('https://pizzabros.co.nz/'), false);
+  assert.equal(isBlocked('http://clunesps.vic.edu.au'), true);
+  assert.equal(isBlocked('https://www.ozfoodhunter.com.au/euro-pizza'), true);
+  assert.equal(isBlocked('https://forestopizza.square.site'), false);
+});
+
+test('currentListName / append: later batches target the numbered file, never the base list', () => {
+  const dir = tmp();
+  assert.equal(currentListName(dir, 'pizza-shops', 'au'), null);
+  fs.writeFileSync(path.join(dir, 'pizza-shops.au.csv'), 'name,website\nA,https://a.com.au\n');
+  assert.equal(currentListName(dir, 'pizza-shops', 'au'), null);
+  const cand = path.join(tmp(), 'cand.csv');
+  fs.writeFileSync(cand, 'name,website\nB,https://b.com.au\n');
+  assert.equal(path.basename(buildList(dir, 'pizza-shops', 'au', cand, true).file), 'pizza-shops-2.au.csv');
+  fs.writeFileSync(path.join(dir, 'pizza-shops-2.au.csv'), 'name,website\nB,https://b.com.au\n');
+  assert.equal(currentListName(dir, 'pizza-shops', 'au'), 'pizza-shops-2.au.csv');
+  fs.writeFileSync(cand, 'name,website\nB,https://b.com.au\nC,https://c.com.au\n');
+  const r = buildList(dir, 'pizza-shops', 'au', cand, true);
+  assert.equal(path.basename(r.file), 'pizza-shops-2.au.csv');
+  assert.deepEqual(r.rows.map((x) => x.website), ['https://c.com.au']);
+  assert.equal(path.basename(buildList(dir, 'pizza-shops', 'au', cand).file), 'pizza-shops-3.au.csv');
 });
