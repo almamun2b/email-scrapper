@@ -85,6 +85,19 @@ For an end-to-end check, write a 2–4 row sample CSV outside `websites/` and ru
 - **Respect robots.txt**, including on the host reached after a redirect, on every redirect hop, on the site's `www.`/`http:` variants (each origin by its own robots.txt), and in the browser fallback, Crawl-delay included. Don't add bypasses.
 - **Each summary is appended** to `results/<category>/logs/<name>.log` after every run. Keep that behaviour for any new mode.
 - `websites/`, `results/` and `logs` are git-ignored data. Never commit them.
+- **No agent attribution in git** (owner decision 2026-10-29). No `Co-Authored-By`, `Claude-Session` or "Generated with …" lines in commit messages or PR bodies, and never set or override the git identity (`git config user.*`, `-c user.name`, `--author`): commit with the owner's active git config.
+
+## Building website lists
+
+When the owner asks to find, search or generate websites for a category (e.g. "all pizza shops in AU and NZ"):
+
+- **Where and what:** `websites/<topic>-<au|nz>/<list>.<au|nz>.csv` with header `name,website`, one row per business site. The same topic in AU and NZ gets one folder each (`pizza-au`, `pizza-nz`).
+- **Never edit or overwrite an existing list** (owner decision 2026-10-29). If `<list>.<cc>.csv` exists, write `<list>-2.<cc>.csv`, then `-3`, … (the next free number; the unnumbered file counts as 1). Chains follow the same rule (`pizza-chains-2.au.csv`). `scripts/new-list.ts` picks the number.
+- **A new numbered file holds only new sites:** anything already in any CSV of that category folder (same host + path, as `readSites()` dedupes) and in-file duplicates are dropped. That way `npm run scrape` only crawls the new file.
+- **Keep** the business's own website. **Drop** social pages, delivery/ordering platforms (ubereats, menulog, doordash, facebook, instagram, linktr.ee, tripadvisor, yelp …), directories, and businesses that are not about the topic (pizza must show in the name, cuisine tag or site, not just "restaurant").
+- **Targets:** the owner's per-country target (pizza: AU 5,000–8,100; NZ as many as exist) is reported against the real count. Never pad with unrelated businesses and never invent sites. Report per country: new sites, duplicates dropped, total in the category, sources used, and the shortfall.
+- **Sources, in order:** OpenStreetMap through Overpass (`scripts/fetch-osm-places.ts`), then public directories and web search for gaps, then a Google Places API key only if the owner gives one. Respect each source's terms and rate limits.
+- **Procedure:** write candidates to the scratchpad, run `scripts/new-list.ts` (use `--dry-run` first), look at a sample, report. Don't scrape emails from a new list until the owner asks.
 
 ## Process hygiene
 

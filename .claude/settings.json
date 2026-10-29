@@ -10,5 +10,9 @@
       "Bash(git rm *)",
       "Bash(git mv *)"
     ]
+  },
+  "attribution": {
+    "commit": "",
+    "pr": ""
   }
 }

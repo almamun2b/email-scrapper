@@ -96,6 +96,7 @@ websites/car-dealers-au/ford.au.csv   ──►   results/car-dealers-au/emails/
 
 - Current categories: `auto-repair-au`, `auto-repair-nz`, `car-dealers-au`, `car-dealers-nz`, `churches-au`, `entertainments-au`, `gifts-au`, `healthcare-nz`, `martial-arts-au`, `pizza-au`, `pizza-nz`, `political-au`, `political-nz`. A category is named for its topic and country (e.g. `healthcare-nz`); a new category is just a new folder: create `websites/<category>/` and put the CSVs in it. Only one level of folders counts.
 - A CSV placed directly in `websites/` (or given from outside it) has no category and gets its own folder named after the file: `websites/clinics.csv` writes to `results/clinics/emails/clinics.csv`, `results/clinics/.cache/`, and so on.
+- Lists are never edited when more sites are found for the same category and name: the new sites go into `<list>-2.<cc>.csv`, then `-3` (`pizza-shops.au.csv` → `pizza-shops-2.au.csv`), holding only sites not already in the category. `scripts/new-list.ts` does this; see "Building website lists" in AGENTS.md.
 - Two lists with the same file name in different categories are fine. Two inputs that would write the same output file are an error.
 
 ## Input format
