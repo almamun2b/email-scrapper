@@ -5,7 +5,7 @@
  * ordering platforms, social pages or directories.
  *
  *   npx tsx scripts/new-list.ts <category> <list> <cc> <candidates.csv> [--dry-run]
- *   npx tsx scripts/new-list.ts pizza-au pizza-shops au /scratch/au.candidates.csv --dry-run
+ *   npx tsx scripts/new-list.ts dentists-au dentists au /scratch/au.candidates.csv --dry-run
  *
  * The candidates need a website column (same detection as any input list) and may have a name column.
  */

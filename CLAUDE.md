@@ -46,7 +46,7 @@ Owner rule (2026-10-29): commits and PR descriptions carry no `Co-Authored-By: C
 
 ## Building website lists
 
-Searching for sites and generating lists follows "Building website lists" in [AGENTS.md](AGENTS.md): an existing list is never edited (a same-named new one is `<list>-2.<cc>.csv`, then `-3`), new files hold only sites not already in the category, and counts are reported against the owner's target without padding. `scripts/fetch-osm-places.ts` and `scripts/new-list.ts` do the work.
+Searching for sites and generating lists follows "Building website lists" in [AGENTS.md](AGENTS.md): an existing list is never edited (a same-named new one is `<list>-2.<cc>.csv`, then `-3`), new files hold only sites not already in the category, and counts are reported against the owner's target without padding. This applies to every sector, not one topic. `scripts/fetch-osm-places.ts` (any sector, via `--match` selectors) and `scripts/new-list.ts` do the work.
 
 ## Architecture (big picture)
 
